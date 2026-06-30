@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mutsuki Service Control Request",
+  "type": "object",
+  "required": ["token", "method"],
+  "properties": {
+    "token": { "type": "string" },
+    "method": {
+      "type": "string",
+      "enum": [
+        "service_status",
+        "service_shutdown",
+        "core_status",
+        "plugin_list",
+        "plugin_reload",
+        "runner_list",
+        "runner_restart",
+        "runner_stop",
+        "task_list",
+        "task_cancel",
+        "health_check",
+        "log_tail"
+      ]
+    },
+    "params": true
+  }
+}

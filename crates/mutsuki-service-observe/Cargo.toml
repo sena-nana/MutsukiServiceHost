@@ -1,0 +1,11 @@
+[package]
+name = "mutsuki-service-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mutsuki-service-config.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true

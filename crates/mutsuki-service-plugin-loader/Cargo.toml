@@ -1,0 +1,11 @@
+[package]
+name = "mutsuki-service-plugin-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mutsuki-runtime-contracts.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

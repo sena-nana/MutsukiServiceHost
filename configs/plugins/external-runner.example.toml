@@ -1,0 +1,59 @@
+enabled = true
+
+[manifest]
+plugin_id = "example.external.runner"
+version = "0.1.0"
+api_version = "mutsuki-plugin-v1"
+requires = []
+
+[manifest.artifact]
+artifact_type = "process"
+path = "example-runner"
+sha256 = "sha256:replace"
+
+[manifest.provides]
+resource_schemas = []
+resource_providers = []
+resource_types = []
+effects = []
+streams = []
+subscriptions = []
+timers = []
+state_schemas = []
+host_extensions = []
+plugin_backends = []
+codecs = []
+bridges = []
+scheduler_policies = []
+workflows = []
+
+[[manifest.provides.runners]]
+runner_id = "example.external.runner"
+plugin_id = "example.external.runner"
+plugin_generation = 1
+accepted_protocol_ids = ["example.task"]
+purity = "effectful"
+execution_class = "io"
+input_schema = {}
+output_schema = {}
+metadata = {}
+contract_surfaces = ["runner:example.external.runner"]
+
+[manifest.permissions]
+effects = []
+resources = []
+
+[manifest.lifecycle]
+reload_policy = "drain_and_swap"
+unload_timeout_ms = 5000
+supports_cancel = true
+supports_dispose = true
+supports_snapshot = false
+
+[manifest.metadata]
+
+[runtime]
+command = "example-runner"
+args = []
+env = {}
+runner_link = "jsonl-stdio"

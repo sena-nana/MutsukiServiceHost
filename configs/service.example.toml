@@ -1,0 +1,42 @@
+[service]
+profile = "default"
+instance_id = "default"
+home_dir = ".mutsuki"
+data_dir = "data"
+log_dir = "logs"
+plugin_dir = "plugins"
+run_dir = "run"
+
+[core]
+max_tasks = 4096
+shutdown_timeout_ms = 30000
+worker_threads = 4
+blocking_threads = 2
+
+[ipc]
+enabled = true
+transport = "named-pipe"
+name = "mutsuki-service-default"
+token = "replace-with-local-control-token"
+tcp_debug_addr = "127.0.0.1:7687"
+
+[plugins]
+builtin = []
+dynamic_dirs = ["plugins/installed"]
+disabled_dir = "plugins/disabled"
+
+[runners]
+restart = true
+max_restart_per_minute = 5
+graceful_shutdown_ms = 5000
+env_allowlist = ["PATH", "SystemRoot", "WINDIR", "COMSPEC"]
+
+[observe]
+console = true
+json = false
+log_file = "service.log"
+panic_file = "panic.log"
+
+[security]
+control_token_env = "MUTSUKI_CONTROL_TOKEN"
+secret_env_prefix = "MUTSUKI_SECRET_"

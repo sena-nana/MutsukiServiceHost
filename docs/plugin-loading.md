@@ -1,0 +1,23 @@
+# Plugin Loading
+
+Dynamic plugin files are named `plugin.toml`. The `[manifest]` table maps to `mutsuki_runtime_contracts::PluginManifest`.
+
+ServiceHost validates:
+
+- `api_version == "mutsuki-plugin-v1"`
+- artifact type matches deployment kind
+- disabled plugin marker is absent
+- runtime env keys do not contain secret-like names such as `TOKEN`, `SECRET`, or `PASSWORD`
+
+External runtimes use:
+
+```toml
+[runtime]
+command = "runner-binary"
+args = []
+env = {}
+cwd = "optional-working-directory"
+runner_link = "jsonl-stdio"
+```
+
+`jsonl-stdio` is the first Core-connected runner link. Other external processes can still be supervised as sidecars, but they are not advertised to Core as executable runners.

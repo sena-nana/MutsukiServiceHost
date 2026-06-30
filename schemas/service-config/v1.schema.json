@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mutsuki Service Config",
+  "type": "object",
+  "properties": {
+    "service": { "type": "object" },
+    "core": { "type": "object" },
+    "ipc": { "type": "object" },
+    "plugins": { "type": "object" },
+    "runners": { "type": "object" },
+    "observe": { "type": "object" },
+    "security": { "type": "object" }
+  }
+}

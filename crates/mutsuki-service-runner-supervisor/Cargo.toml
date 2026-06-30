@@ -1,0 +1,13 @@
+[package]
+name = "mutsuki-service-runner-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mutsuki-service-config.workspace = true
+mutsuki-service-plugin-loader.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
