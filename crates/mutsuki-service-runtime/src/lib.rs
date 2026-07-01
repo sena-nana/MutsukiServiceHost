@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use mutsuki_runtime_contracts::{
     PluginDeploymentKind, RunnerContext, RunnerDescriptor, RunnerResult, RuntimeProfile,
-    RuntimeProfileMode, SurfaceCompatibility, Task,
+    RuntimeProfileMode, SurfaceCompatibility, Task, TaskStatus,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 use mutsuki_runtime_host::{
-    HostRuntime, HostRuntimeCommand, HostRuntimeConfig, RuntimeBootstrapper,
+    HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostTaskSnapshot, RuntimeBootstrapper,
 };
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
@@ -19,6 +19,7 @@ use mutsuki_service_control::{
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
     PluginCallParams, PluginReloadChange, PluginReloadResponse, PluginStatus,
     RunnerStatus as ControlRunnerStatus, ServiceStatus,
+    TaskFailureSummary as ControlTaskFailureSummary, TaskSnapshot as ControlTaskSnapshot,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -178,9 +179,7 @@ impl ServiceRuntimeInner {
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
-            ControlMethod::TaskList => {
-                ControlResponse::err(ControlError::Unsupported("task.list snapshot".into()))
-            }
+            ControlMethod::TaskList => self.task_list(),
             ControlMethod::TaskCancel => self.task_cancel(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
@@ -363,6 +362,17 @@ impl ServiceRuntimeInner {
         };
         match self.supervisor.stop(&param.id).await {
             Ok(()) => ControlResponse::empty_ok(),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn task_list(&self) -> ControlResponse {
+        let mut guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_mut() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        match runtime.task_snapshots() {
+            Ok(snapshots) => ControlResponse::ok(to_control_task_snapshots(snapshots)),
             Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
         }
     }
@@ -681,6 +691,52 @@ fn to_control_runner_status(snapshots: Vec<RunnerSnapshot>) -> Vec<ControlRunner
         .collect()
 }
 
+fn to_control_task_snapshots(snapshots: Vec<HostTaskSnapshot>) -> Vec<ControlTaskSnapshot> {
+    snapshots
+        .into_iter()
+        .map(|snapshot| ControlTaskSnapshot {
+            task_id: snapshot.task_id,
+            protocol_id: snapshot.protocol_id,
+            status: task_status_name(&snapshot.status).into(),
+            priority: snapshot.priority,
+            ready_at_step: snapshot.ready_at_step,
+            created_sequence: snapshot.created_sequence,
+            registry_generation: snapshot.registry_generation,
+            target_binding_id: snapshot.target_binding_id,
+            runner_hint: snapshot.runner_hint,
+            claimed_by: snapshot.claimed_by,
+            owner_runner: snapshot.owner_runner,
+            lease_id: snapshot.lease_id,
+            trace_id: snapshot.trace_id,
+            correlation_id: snapshot.correlation_id,
+            input_refs: snapshot.input_refs,
+            output_ref: snapshot.output_ref,
+            continuation_ref: snapshot.continuation_ref,
+            required_surfaces: snapshot.required_surfaces,
+            failure: snapshot.failure.map(|failure| ControlTaskFailureSummary {
+                code: failure.code,
+                source: failure.source,
+                route: failure.route,
+            }),
+        })
+        .collect()
+}
+
+fn task_status_name(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Created => "created",
+        TaskStatus::Ready => "ready",
+        TaskStatus::Running => "running",
+        TaskStatus::Waiting => "waiting",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Expired => "expired",
+        TaskStatus::DeadLetter => "dead_letter",
+    }
+}
+
 struct StdioJsonlRunner {
     descriptor: RunnerDescriptor,
     child: Child,
@@ -840,7 +896,7 @@ mod tests {
         PluginProvides,
     };
     use mutsuki_service_control::{
-        ConversationSendResponse, PluginCallParams, PluginReloadResponse,
+        ConversationSendResponse, PluginCallParams, PluginReloadResponse, TaskSnapshot,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -992,6 +1048,47 @@ mod tests {
             .await;
         assert!(!unsupported.ok);
         assert_eq!(unsupported.error.expect("error").code, "unsupported");
+    }
+
+    #[tokio::test]
+    async fn task_list_returns_live_runtime_snapshots() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        {
+            let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
+            let runtime = guard.as_mut().expect("runtime started");
+            let mut task = Task::new("control-task-1", "control.input", json!({ "hidden": true }));
+            task.priority = 3;
+            task.trace_id = Some("trace-control".into());
+            task.required_surfaces = vec!["surface:control".into()];
+            runtime
+                .dispatch(HostRuntimeCommand::SubmitTask(Box::new(task)))
+                .expect("submit task");
+        }
+
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskList,
+                params: Value::Null,
+            })
+            .await;
+
+        assert!(response.ok);
+        let snapshots: Vec<TaskSnapshot> =
+            serde_json::from_value(response.result.expect("result")).expect("task snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].task_id, "control-task-1");
+        assert_eq!(snapshots[0].protocol_id, "control.input");
+        assert_eq!(snapshots[0].status, "ready");
+        assert_eq!(snapshots[0].priority, 3);
+        assert_eq!(snapshots[0].trace_id.as_deref(), Some("trace-control"));
+        assert_eq!(
+            snapshots[0].required_surfaces,
+            vec!["surface:control".to_string()]
+        );
+        assert!(snapshots[0].lease_id.is_none());
+        assert!(snapshots[0].failure.is_none());
     }
 
     #[tokio::test]

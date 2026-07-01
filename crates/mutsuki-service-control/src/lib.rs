@@ -155,6 +155,36 @@ pub struct RunnerStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskFailureSummary {
+    pub code: String,
+    pub source: String,
+    pub route: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub task_id: String,
+    pub protocol_id: String,
+    pub status: String,
+    pub priority: i64,
+    pub ready_at_step: Option<u64>,
+    pub created_sequence: u64,
+    pub registry_generation: u64,
+    pub target_binding_id: Option<String>,
+    pub runner_hint: Option<String>,
+    pub claimed_by: Option<String>,
+    pub owner_runner: Option<String>,
+    pub lease_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub input_refs: Vec<String>,
+    pub output_ref: Option<String>,
+    pub continuation_ref: Option<String>,
+    pub required_surfaces: Vec<String>,
+    pub failure: Option<TaskFailureSummary>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthReport {
     pub service: String,

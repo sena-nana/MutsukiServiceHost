@@ -28,11 +28,10 @@ The service host does not own task scheduling. Core remains the source of truth 
 - JSONL stdio external runners registered with Core.
 - Sidecar process supervision for external runtimes that do not expose Core runner descriptors.
 - Local control API over Windows named pipe, Unix socket, or explicit TCP debug transport.
-- Authenticated service status, core status, plugin list, runner list/restart/stop, task cancel, health, shutdown.
+- Authenticated service status, core status, plugin list, runner list/restart/stop, task list/cancel, health, shutdown.
 - Authenticated plugin reload with manifest rescan, Core generation drain/swap, catalog replacement, and sidecar reconciliation.
 - Windows Service install, uninstall, start, and SCM stop handling.
 
 ## Explicit Gaps
 
-- `task.list` is not faked because the current `mutsuki-runtime-host` command API does not expose a task snapshot command.
 - systemd/launchd installation is not implemented yet; non-Windows daemon commands return explicit unsupported errors.

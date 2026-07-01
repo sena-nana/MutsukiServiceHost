@@ -17,7 +17,7 @@ Response:
 Error:
 
 ```json
-{"ok":false,"error":{"code":"unsupported","message":"task.list snapshot is not supported by the current runtime API"}}
+{"ok":false,"error":{"code":"failed","message":"core is not running"}}
 ```
 
 ## Methods
@@ -37,6 +37,37 @@ Error:
 - `log_tail`
 
 Unsupported methods are intentionally explicit where the current Core host API has no safe backing operation.
+
+`task_list` returns live operational snapshots from the host runtime. Task payloads and detailed
+runtime error evidence are intentionally omitted from the control response.
+
+Successful task list response:
+
+```json
+[
+  {
+    "task_id": "task-1",
+    "protocol_id": "raw.input",
+    "status": "ready",
+    "priority": 0,
+    "ready_at_step": null,
+    "created_sequence": 1,
+    "registry_generation": 1,
+    "target_binding_id": null,
+    "runner_hint": null,
+    "claimed_by": null,
+    "owner_runner": null,
+    "lease_id": null,
+    "trace_id": null,
+    "correlation_id": null,
+    "input_refs": [],
+    "output_ref": null,
+    "continuation_ref": null,
+    "required_surfaces": [],
+    "failure": null
+  }
+]
+```
 
 `plugin_reload` rescans configured plugin directories, validates manifests, prepares the next Core load plan generation, drains active runner work, swaps Core to the new generation, then replaces the ServiceHost catalog. Sidecar runners are reconciled after the Core swap; sidecar start/stop errors are returned in `runner_errors` because a successful Core generation swap is not rolled back.
 

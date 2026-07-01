@@ -26,6 +26,89 @@
     "params": true
   },
   "$defs": {
+    "taskListResponse": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/taskSnapshot" }
+    },
+    "taskSnapshot": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "protocol_id",
+        "status",
+        "priority",
+        "ready_at_step",
+        "created_sequence",
+        "registry_generation",
+        "target_binding_id",
+        "runner_hint",
+        "claimed_by",
+        "owner_runner",
+        "lease_id",
+        "trace_id",
+        "correlation_id",
+        "input_refs",
+        "output_ref",
+        "continuation_ref",
+        "required_surfaces",
+        "failure"
+      ],
+      "properties": {
+        "task_id": { "type": "string" },
+        "protocol_id": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": [
+            "created",
+            "ready",
+            "running",
+            "waiting",
+            "blocked",
+            "completed",
+            "failed",
+            "cancelled",
+            "expired",
+            "dead_letter"
+          ]
+        },
+        "priority": { "type": "integer" },
+        "ready_at_step": { "type": ["integer", "null"], "minimum": 0 },
+        "created_sequence": { "type": "integer", "minimum": 0 },
+        "registry_generation": { "type": "integer", "minimum": 0 },
+        "target_binding_id": { "type": ["string", "null"] },
+        "runner_hint": { "type": ["string", "null"] },
+        "claimed_by": { "type": ["string", "null"] },
+        "owner_runner": { "type": ["string", "null"] },
+        "lease_id": { "type": ["string", "null"] },
+        "trace_id": { "type": ["string", "null"] },
+        "correlation_id": { "type": ["string", "null"] },
+        "input_refs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "output_ref": { "type": ["string", "null"] },
+        "continuation_ref": { "type": ["string", "null"] },
+        "required_surfaces": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "failure": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/taskFailureSummary" }
+          ]
+        }
+      }
+    },
+    "taskFailureSummary": {
+      "type": "object",
+      "required": ["code", "source", "route"],
+      "properties": {
+        "code": { "type": "string" },
+        "source": { "type": "string" },
+        "route": { "type": "string" }
+      }
+    },
     "pluginReloadResponse": {
       "type": "object",
       "required": [
