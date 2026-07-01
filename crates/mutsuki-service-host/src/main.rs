@@ -24,6 +24,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Run,
+    Tui,
     Status,
     Stop,
     Health,
@@ -71,6 +72,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Run => {
             let runtime = mutsuki_service_runtime::ServiceRuntime::start(config).await?;
             runtime.run_foreground().await?;
+        }
+        Command::Tui => {
+            mutsuki_service_tui::run(config).await?;
         }
         Command::Status => {
             request_and_print(&config, ControlMethod::ServiceStatus, Value::Null).await?

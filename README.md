@@ -23,6 +23,9 @@ crates/
   mutsuki-service-runtime           service lifecycle and Core bootstrap
   mutsuki-service-config            config/profile/path/token loading
   mutsuki-service-plugin-loader     plugin.toml discovery and validation
+  mutsuki-service-plugin-conversation-sim optional simulated conversation plugin
+  mutsuki-service-plugin-terminal-tui     optional terminal TUI support plugin
+  mutsuki-service-tui               terminal client library
   mutsuki-service-runner-supervisor external process supervision
   mutsuki-service-control           control request/response API
   mutsuki-service-ipc               named pipe / Unix socket / TCP debug transport
@@ -41,6 +44,7 @@ In another shell:
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token status
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token health
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin list
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token tui
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token stop
 ```
 
@@ -59,6 +63,10 @@ runner_link = "jsonl-stdio"
 ```
 
 `jsonl-stdio` runners are launched and registered with Core as external runners. Sidecar processes without Core runner descriptors are supervised by the runner supervisor and exposed through the control API.
+
+The default binary also links optional builtin host plugins for terminal conversation simulation.
+Enable `mutsuki.conversation.sim` and `mutsuki.terminal.tui` in `[plugins].builtin`, then attach with
+`mutsuki-service tui`.
 
 ## Validation
 

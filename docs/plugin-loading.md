@@ -21,3 +21,11 @@ runner_link = "jsonl-stdio"
 ```
 
 `jsonl-stdio` is the first Core-connected runner link. Other external processes can still be supervised as sidecars, but they are not advertised to Core as executable runners.
+
+Builtin host plugins are linked at compile time and enabled through `[plugins].builtin`.
+The default ServiceHost build links:
+
+- `mutsuki.conversation.sim`
+- `mutsuki.terminal.tui`
+
+If a requested builtin was not linked into the binary, startup fails with `BuiltinUnavailable`.

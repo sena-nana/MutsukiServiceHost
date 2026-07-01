@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mutsuki_runtime_contracts::{ArtifactType, PluginDeploymentKind, PluginManifest};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginLoaderError {
@@ -73,35 +75,70 @@ pub struct PluginRecord {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PluginCatalog {
     pub records: Vec<PluginRecord>,
+    pub host_plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BuiltinRegistry {
-    manifests: BTreeMap<String, PluginManifest>,
+    plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
+
+#[derive(Clone, Default)]
+pub struct BuiltinSelection {
+    pub records: Vec<PluginRecord>,
+    pub host_plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
+}
+
+pub trait HostPlugin: Send + Sync {
+    fn manifest(&self) -> &PluginManifest;
+    fn call(&self, operation: &str, payload: Value) -> HostPluginCallResult<Value>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HostPluginCallError {
+    #[error("unsupported plugin operation: {0}")]
+    UnsupportedOperation(String),
+    #[error("bad plugin request: {0}")]
+    BadRequest(String),
+    #[error("plugin operation failed: {0}")]
+    Failed(String),
+}
+
+pub type HostPluginCallResult<T> = Result<T, HostPluginCallError>;
 
 impl BuiltinRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn load_requested(&self, requested: &[String]) -> PluginLoaderResult<Vec<PluginRecord>> {
+    pub fn register(&mut self, plugin: Arc<dyn HostPlugin>) {
+        self.plugins
+            .insert(plugin.manifest().plugin_id.clone(), plugin);
+    }
+
+    pub fn load_requested(&self, requested: &[String]) -> PluginLoaderResult<BuiltinSelection> {
         let mut records = Vec::new();
+        let mut host_plugins = BTreeMap::new();
         for plugin_id in requested {
-            let Some(manifest) = self.manifests.get(plugin_id) else {
+            let Some(plugin) = self.plugins.get(plugin_id) else {
                 return Err(PluginLoaderError::BuiltinUnavailable(plugin_id.clone()));
             };
+            let manifest = plugin.manifest();
             records.push(PluginRecord {
                 manifest_path: PathBuf::from("<builtin>"),
                 manifest: manifest.clone(),
                 runtime: None,
                 enabled: true,
             });
+            host_plugins.insert(plugin_id.clone(), plugin.clone());
         }
-        Ok(records)
+        Ok(BuiltinSelection {
+            records,
+            host_plugins,
+        })
     }
 }
 
@@ -109,9 +146,9 @@ impl PluginCatalog {
     pub fn scan(
         dynamic_dirs: &[PathBuf],
         disabled_dir: &Path,
-        builtin: Vec<PluginRecord>,
+        builtin: BuiltinSelection,
     ) -> PluginLoaderResult<Self> {
-        let mut records = builtin;
+        let mut records = builtin.records;
         let disabled_plugins = disabled_plugins(disabled_dir);
         for dir in dynamic_dirs {
             if !dir.exists() {
@@ -149,7 +186,10 @@ impl PluginCatalog {
             }
         }
         records.sort_by(|a, b| a.manifest.plugin_id.cmp(&b.manifest.plugin_id));
-        Ok(Self { records })
+        Ok(Self {
+            records,
+            host_plugins: builtin.host_plugins,
+        })
     }
 
     pub fn external_records(&self) -> impl Iterator<Item = &PluginRecord> {

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,12 +15,13 @@ use mutsuki_runtime_host::{
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
-    CoreStatus, HealthReport, IdParam, PluginStatus, RunnerStatus as ControlRunnerStatus,
-    ServiceStatus,
+    CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
+    PluginCallParams, PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
-    BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginLoaderError, PluginRecord,
+    BuiltinRegistry, ExternalRuntimeSpec, HostPluginCallError, PluginCatalog, PluginLoaderError,
+    PluginRecord,
 };
 use mutsuki_service_runner_supervisor::{
     ManagedRunnerSpec, RunnerProcessState, RunnerSnapshot, RunnerSupervisor,
@@ -153,18 +154,19 @@ impl ServiceRuntimeInner {
             ControlMethod::ServiceShutdown => self.service_shutdown(),
             ControlMethod::CoreStatus => self.core_status(),
             ControlMethod::PluginList => self.plugin_list(),
-            ControlMethod::PluginReload => {
-                ControlResponse::err(ControlError::Unsupported("plugin.reload generation swap"))
-            }
+            ControlMethod::PluginReload => ControlResponse::err(ControlError::Unsupported(
+                "plugin.reload generation swap".into(),
+            )),
+            ControlMethod::PluginCall => self.plugin_call(request.params),
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
             ControlMethod::TaskList => {
-                ControlResponse::err(ControlError::Unsupported("task.list snapshot"))
+                ControlResponse::err(ControlError::Unsupported("task.list snapshot".into()))
             }
             ControlMethod::TaskCancel => self.task_cancel(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
-            ControlMethod::LogTail => ControlResponse::err(ControlError::Unsupported("log.tail")),
+            ControlMethod::LogTail => self.log_tail(request.params),
         }
     }
 
@@ -231,6 +233,31 @@ impl ServiceRuntimeInner {
             })
             .collect::<Vec<_>>();
         ControlResponse::ok(plugins)
+    }
+
+    fn plugin_call(&self, params: Value) -> ControlResponse {
+        let params = match serde_json::from_value::<PluginCallParams>(params) {
+            Ok(params) => params,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        let Some(plugin) = self.catalog.host_plugins.get(&params.plugin_id) else {
+            return ControlResponse::err(ControlError::Failed(format!(
+                "plugin {} is not loaded or does not expose host operations",
+                params.plugin_id
+            )));
+        };
+        match plugin.call(&params.operation, params.payload) {
+            Ok(value) => ControlResponse::ok(value),
+            Err(HostPluginCallError::UnsupportedOperation(operation)) => ControlResponse::err(
+                ControlError::Unsupported(format!("plugin operation {operation}")),
+            ),
+            Err(HostPluginCallError::BadRequest(message)) => {
+                ControlResponse::err(ControlError::BadRequest(message))
+            }
+            Err(HostPluginCallError::Failed(message)) => {
+                ControlResponse::err(ControlError::Failed(message))
+            }
+        }
     }
 
     async fn runner_list(&self) -> ControlResponse {
@@ -303,15 +330,92 @@ impl ServiceRuntimeInner {
         };
         ControlResponse::ok(report)
     }
+
+    fn log_tail(&self, params: Value) -> ControlResponse {
+        let params = match serde_json::from_value::<LogTailParams>(params) {
+            Ok(params) => params,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        match read_log_tail(
+            self.config
+                .service
+                .log_dir
+                .join(&self.config.observe.log_file),
+            params,
+        ) {
+            Ok(response) => ControlResponse::ok(response),
+            Err(error) => ControlResponse::err(error),
+        }
+    }
 }
 
 fn load_catalog(config: &ServiceConfig) -> ServiceRuntimeResult<PluginCatalog> {
-    let builtin = BuiltinRegistry::new().load_requested(&config.plugins.builtin)?;
+    let builtin = builtin_registry().load_requested(&config.plugins.builtin)?;
     Ok(PluginCatalog::scan(
         &config.plugins.dynamic_dirs,
         &config.plugins.disabled_dir,
         builtin,
     )?)
+}
+
+fn builtin_registry() -> BuiltinRegistry {
+    let mut registry = BuiltinRegistry::new();
+    #[cfg(feature = "conversation-sim")]
+    registry.register(mutsuki_service_plugin_conversation_sim::plugin());
+    #[cfg(feature = "terminal-tui")]
+    registry.register(mutsuki_service_plugin_terminal_tui::plugin());
+    registry
+}
+
+fn read_log_tail(
+    path: impl AsRef<std::path::Path>,
+    params: LogTailParams,
+) -> Result<LogTailResponse, ControlError> {
+    if !params.filters.is_empty() {
+        return Err(ControlError::BadRequest(
+            "log_tail filters are not supported by this runtime".into(),
+        ));
+    }
+
+    let path = path.as_ref();
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(LogTailResponse {
+            cursor: 0,
+            entries: Vec::new(),
+        });
+    };
+    let len = metadata.len();
+    let start = params.cursor.filter(|cursor| *cursor <= len).unwrap_or(0);
+    let file =
+        std::fs::File::open(path).map_err(|error| ControlError::Failed(error.to_string()))?;
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(|error| ControlError::Failed(error.to_string()))?;
+
+    let max_lines = params.lines.unwrap_or(100);
+    let mut entries = Vec::new();
+    let mut cursor = start;
+    loop {
+        let offset = cursor;
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| ControlError::Failed(error.to_string()))?;
+        if bytes == 0 {
+            break;
+        }
+        cursor += bytes as u64;
+        entries.push(LogTailEntry {
+            offset,
+            line: line.trim_end_matches(['\r', '\n']).to_string(),
+        });
+    }
+    if entries.len() > max_lines {
+        entries.drain(0..entries.len() - max_lines);
+    }
+
+    Ok(LogTailResponse { cursor, entries })
 }
 
 fn boot_core(config: &ServiceConfig, catalog: &PluginCatalog) -> ServiceRuntimeResult<HostRuntime> {
@@ -593,4 +697,183 @@ fn runtime_failure(route: impl Into<String>, reason: impl Into<String>) -> Runti
         mutsuki_runtime_contracts::ScalarValue::String(reason.into()),
     );
     RuntimeFailure::new(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use mutsuki_service_control::{ConversationSendResponse, PluginCallParams};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn log_tail_reads_recent_lines_and_advances_cursor() {
+        let dir = tempdir().expect("temp dir");
+        let log_path = dir.path().join("service.log");
+        std::fs::write(&log_path, "one\ntwo\nthree\n").expect("write log");
+
+        let response = read_log_tail(
+            &log_path,
+            LogTailParams {
+                cursor: None,
+                lines: Some(2),
+                filters: Default::default(),
+            },
+        )
+        .expect("tail succeeds");
+
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(response.entries[0].line, "two");
+        assert_eq!(response.entries[1].line, "three");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("open log")
+            .write_all(b"four\n")
+            .expect("append log");
+        let next = read_log_tail(
+            &log_path,
+            LogTailParams {
+                cursor: Some(response.cursor),
+                lines: Some(10),
+                filters: Default::default(),
+            },
+        )
+        .expect("incremental tail succeeds");
+
+        assert_eq!(next.entries.len(), 1);
+        assert_eq!(next.entries[0].line, "four");
+        assert!(next.cursor > response.cursor);
+    }
+
+    #[test]
+    fn log_tail_resets_cursor_after_truncation() {
+        let dir = tempdir().expect("temp dir");
+        let log_path = dir.path().join("service.log");
+        std::fs::write(&log_path, "fresh\n").expect("write log");
+
+        let response = read_log_tail(
+            &log_path,
+            LogTailParams {
+                cursor: Some(10_000),
+                lines: Some(10),
+                filters: Default::default(),
+            },
+        )
+        .expect("tail succeeds");
+
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].line, "fresh");
+    }
+
+    #[test]
+    fn log_tail_rejects_filters() {
+        let dir = tempdir().expect("temp dir");
+        let log_path = dir.path().join("service.log");
+        std::fs::write(&log_path, "line\n").expect("write log");
+        let mut filters = BTreeMap::new();
+        filters.insert("level".into(), "info".into());
+
+        let error = read_log_tail(
+            &log_path,
+            LogTailParams {
+                cursor: None,
+                lines: None,
+                filters,
+            },
+        )
+        .expect_err("filters rejected");
+
+        assert!(matches!(error, ControlError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn plugin_call_checks_auth_and_dispatches_loaded_builtin() {
+        let inner = test_runtime_inner("token");
+
+        let unauthorized = inner
+            .handle_request(ControlRequest {
+                token: "wrong".into(),
+                method: ControlMethod::PluginCall,
+                params: Value::Null,
+            })
+            .await;
+        assert!(!unauthorized.ok);
+        assert_eq!(unauthorized.error.expect("error").code, "unauthorized");
+
+        let success = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginCall,
+                params: json!(PluginCallParams {
+                    plugin_id: mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into(),
+                    operation: "send".into(),
+                    payload: json!({ "message": "hello" }),
+                }),
+            })
+            .await;
+        assert!(success.ok);
+        let response: ConversationSendResponse =
+            serde_json::from_value(success.result.expect("result")).expect("send response");
+        assert_eq!(response.turns.len(), 2);
+        assert_eq!(response.reply.role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn plugin_call_reports_unknown_plugin_and_operation() {
+        let inner = test_runtime_inner("token");
+
+        let missing = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginCall,
+                params: json!(PluginCallParams {
+                    plugin_id: "missing".into(),
+                    operation: "send".into(),
+                    payload: json!({ "message": "hello" }),
+                }),
+            })
+            .await;
+        assert!(!missing.ok);
+        assert_eq!(missing.error.expect("error").code, "failed");
+
+        let unsupported = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginCall,
+                params: json!(PluginCallParams {
+                    plugin_id: mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into(),
+                    operation: "missing".into(),
+                    payload: Value::Null,
+                }),
+            })
+            .await;
+        assert!(!unsupported.ok);
+        assert_eq!(unsupported.error.expect("error").code, "unsupported");
+    }
+
+    fn test_runtime_inner(token: &str) -> ServiceRuntimeInner {
+        let mut config = ServiceConfig::default();
+        config.ipc.token = Some(token.into());
+        let mut registry = BuiltinRegistry::new();
+        registry.register(mutsuki_service_plugin_conversation_sim::plugin());
+        let selection = registry
+            .load_requested(&[mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into()])
+            .expect("builtin available");
+        let catalog = PluginCatalog::scan(&[], Path::new("missing-disabled"), selection)
+            .expect("catalog scan");
+
+        ServiceRuntimeInner {
+            config,
+            started_at: Instant::now(),
+            catalog,
+            host_runtime: Mutex::new(None),
+            supervisor: RunnerSupervisor::new(),
+            shutdown_tx: Mutex::new(None),
+        }
+    }
 }

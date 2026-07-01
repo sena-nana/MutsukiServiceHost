@@ -21,7 +21,7 @@ token = "replace-with-local-control-token"
 tcp_debug_addr = "127.0.0.1:7687"
 
 [plugins]
-builtin = []
+builtin = ["mutsuki.conversation.sim", "mutsuki.terminal.tui"]
 dynamic_dirs = ["plugins/installed"]
 disabled_dir = "plugins/disabled"
 

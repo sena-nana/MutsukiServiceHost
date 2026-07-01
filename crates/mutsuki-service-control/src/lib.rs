@@ -27,6 +27,7 @@ pub enum ControlMethod {
     CoreStatus,
     PluginList,
     PluginReload,
+    PluginCall,
     RunnerList,
     RunnerRestart,
     RunnerStop,
@@ -56,7 +57,7 @@ pub enum ControlError {
     #[error("unauthorized control request")]
     Unauthorized,
     #[error("unsupported control method: {0}")]
-    Unsupported(&'static str),
+    Unsupported(String),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("operation failed: {0}")]
@@ -155,7 +156,58 @@ pub struct IdParam {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LogTailParams {
+    pub cursor: Option<u64>,
     pub lines: Option<usize>,
     #[serde(default)]
     pub filters: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogTailEntry {
+    pub offset: u64,
+    pub line: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogTailResponse {
+    pub cursor: u64,
+    pub entries: Vec<LogTailEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginCallParams {
+    pub plugin_id: String,
+    pub operation: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub sequence: u64,
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationSendParams {
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationSendResponse {
+    pub reply: ConversationTurn,
+    pub turns: Vec<ConversationTurn>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationHistoryResponse {
+    pub turns: Vec<ConversationTurn>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalTuiStatus {
+    pub available: bool,
+    pub renderer: String,
+    pub conversation_plugin_id: String,
 }

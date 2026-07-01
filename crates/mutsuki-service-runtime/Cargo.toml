@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["conversation-sim", "terminal-tui"]
+conversation-sim = ["dep:mutsuki-service-plugin-conversation-sim"]
+terminal-tui = [
+    "conversation-sim",
+    "dep:mutsuki-service-plugin-terminal-tui",
+]
+
 [dependencies]
 anyhow.workspace = true
 futures.workspace = true
@@ -16,8 +24,13 @@ mutsuki-service-control.workspace = true
 mutsuki-service-ipc.workspace = true
 mutsuki-service-observe.workspace = true
 mutsuki-service-plugin-loader.workspace = true
+mutsuki-service-plugin-conversation-sim = { workspace = true, optional = true }
+mutsuki-service-plugin-terminal-tui = { workspace = true, optional = true }
 mutsuki-service-runner-supervisor.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

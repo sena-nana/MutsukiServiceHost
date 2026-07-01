@@ -1,20 +1,16 @@
 [package]
-name = "mutsuki-service-host"
+name = "mutsuki-service-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "mutsuki-service"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+crossterm.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-control.workspace = true
 mutsuki-service-ipc.workspace = true
-mutsuki-service-runtime.workspace = true
-mutsuki-service-tui.workspace = true
+ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

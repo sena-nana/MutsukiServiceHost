@@ -13,6 +13,7 @@
         "core_status",
         "plugin_list",
         "plugin_reload",
+        "plugin_call",
         "runner_list",
         "runner_restart",
         "runner_stop",
