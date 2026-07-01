@@ -29,3 +29,8 @@ The default ServiceHost build links:
 - `mutsuki.terminal.tui`
 
 If a requested builtin was not linked into the binary, startup fails with `BuiltinUnavailable`.
+
+`plugin_reload` uses the same loader path as startup. The host rescans and validates manifests,
+prepares a new Core load-plan generation, drains active runtime work, swaps Core through
+`mutsuki-runtime-host`, then replaces the active catalog. External sidecars that are not Core
+stdio runners are reconciled after the swap.

@@ -131,6 +131,21 @@ pub struct PluginStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginReloadResponse {
+    pub previous_generation: u64,
+    pub registry_generation: u64,
+    pub plugin_count: usize,
+    pub changes: Vec<PluginReloadChange>,
+    pub runner_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginReloadChange {
+    pub surface_id: String,
+    pub compatibility: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunnerStatus {
     pub runner_id: String,
     pub plugin_id: String,

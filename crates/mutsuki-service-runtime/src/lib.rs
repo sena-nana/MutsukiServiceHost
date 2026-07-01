@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use mutsuki_runtime_contracts::{
     PluginDeploymentKind, RunnerContext, RunnerDescriptor, RunnerResult, RuntimeProfile,
-    RuntimeProfileMode, Task,
+    RuntimeProfileMode, SurfaceCompatibility, Task,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 use mutsuki_runtime_host::{
@@ -17,7 +17,8 @@ use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
-    PluginCallParams, PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus,
+    PluginCallParams, PluginReloadChange, PluginReloadResponse, PluginStatus,
+    RunnerStatus as ControlRunnerStatus, ServiceStatus,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -61,7 +62,7 @@ pub struct ServiceRuntime {
 struct ServiceRuntimeInner {
     config: ServiceConfig,
     started_at: Instant,
-    catalog: PluginCatalog,
+    catalog: Mutex<PluginCatalog>,
     host_runtime: Mutex<Option<HostRuntime>>,
     supervisor: RunnerSupervisor,
     shutdown_tx: Mutex<Option<oneshot::Sender<String>>>,
@@ -79,7 +80,7 @@ impl ServiceRuntime {
         let inner = Arc::new(ServiceRuntimeInner {
             config,
             started_at: Instant::now(),
-            catalog,
+            catalog: Mutex::new(catalog),
             host_runtime: Mutex::new(Some(host_runtime)),
             supervisor,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
@@ -172,9 +173,7 @@ impl ServiceRuntimeInner {
             ControlMethod::ServiceShutdown => self.service_shutdown(),
             ControlMethod::CoreStatus => self.core_status(),
             ControlMethod::PluginList => self.plugin_list(),
-            ControlMethod::PluginReload => ControlResponse::err(ControlError::Unsupported(
-                "plugin.reload generation swap".into(),
-            )),
+            ControlMethod::PluginReload => self.plugin_reload().await,
             ControlMethod::PluginCall => self.plugin_call(request.params),
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
@@ -201,7 +200,7 @@ impl ServiceRuntimeInner {
             uptime_ms: self.started_at.elapsed().as_millis(),
             ipc_endpoint: self.config.ipc_endpoint(),
             core_running,
-            plugin_count: self.catalog.records.len(),
+            plugin_count: self.catalog.lock().expect("catalog mutex").records.len(),
             runner_count: runners.len(),
         })
     }
@@ -228,8 +227,8 @@ impl ServiceRuntimeInner {
     }
 
     fn plugin_list(&self) -> ControlResponse {
-        let plugins = self
-            .catalog
+        let catalog = self.catalog.lock().expect("catalog mutex");
+        let plugins = catalog
             .records
             .iter()
             .map(|record| PluginStatus {
@@ -253,12 +252,75 @@ impl ServiceRuntimeInner {
         ControlResponse::ok(plugins)
     }
 
+    async fn plugin_reload(&self) -> ControlResponse {
+        let new_catalog = match load_catalog(&self.config) {
+            Ok(catalog) => catalog,
+            Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+        };
+        let previous_generation = {
+            let guard = self.host_runtime.lock().expect("host runtime mutex");
+            let Some(runtime) = guard.as_ref() else {
+                return ControlResponse::err(ControlError::Failed("core is not running".into()));
+            };
+            runtime.host_context().registry_generation()
+        };
+        let registry_generation = previous_generation.saturating_add(1);
+        let prepared =
+            match runtime_bootstrapper(&self.config, &new_catalog).and_then(
+                |(bootstrapper, profile)| {
+                    Ok(bootstrapper.prepare_reload(profile, registry_generation)?)
+                },
+            ) {
+                Ok(reload) => reload,
+                Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+            };
+        let drain_timeout = reload_drain_timeout(&self.config, &new_catalog);
+        let plugin_count = new_catalog.records.len();
+        let sidecars = sidecar_specs(&self.config, &new_catalog);
+        let decision = {
+            let mut guard = self.host_runtime.lock().expect("host runtime mutex");
+            let Some(runtime) = guard.as_mut() else {
+                return ControlResponse::err(ControlError::Failed("core is not running".into()));
+            };
+            match runtime.reload(prepared, drain_timeout) {
+                Ok(decision) => decision,
+                Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+            }
+        };
+
+        *self.catalog.lock().expect("catalog mutex") = new_catalog;
+        let runner_errors = reconcile_supervised_sidecars(
+            sidecars,
+            &self.supervisor,
+            Duration::from_millis(self.config.runners.graceful_shutdown_ms),
+        )
+        .await;
+        ControlResponse::ok(PluginReloadResponse {
+            previous_generation,
+            registry_generation,
+            plugin_count,
+            changes: decision
+                .changes
+                .into_iter()
+                .map(|change| PluginReloadChange {
+                    surface_id: change.surface_id,
+                    compatibility: surface_compatibility(change.compatibility),
+                })
+                .collect(),
+            runner_errors,
+        })
+    }
+
     fn plugin_call(&self, params: Value) -> ControlResponse {
         let params = match serde_json::from_value::<PluginCallParams>(params) {
             Ok(params) => params,
             Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
         };
-        let Some(plugin) = self.catalog.host_plugins.get(&params.plugin_id) else {
+        let plugin = {
+            let catalog = self.catalog.lock().expect("catalog mutex");
+            catalog.host_plugins.get(&params.plugin_id).cloned()
+        };
+        let Some(plugin) = plugin else {
             return ControlResponse::err(ControlError::Failed(format!(
                 "plugin {} is not loaded or does not expose host operations",
                 params.plugin_id
@@ -437,6 +499,17 @@ fn read_log_tail(
 }
 
 fn boot_core(config: &ServiceConfig, catalog: &PluginCatalog) -> ServiceRuntimeResult<HostRuntime> {
+    let (bootstrapper, profile) = runtime_bootstrapper(config, catalog)?;
+    let mut host_config = HostRuntimeConfig::default();
+    host_config.worker_threads = config.core.worker_threads;
+    host_config.blocking_threads = config.core.blocking_threads;
+    Ok(bootstrapper.into_host_runtime_with_config(profile, host_config)?)
+}
+
+fn runtime_bootstrapper(
+    config: &ServiceConfig,
+    catalog: &PluginCatalog,
+) -> ServiceRuntimeResult<(RuntimeBootstrapper, RuntimeProfile)> {
     let mut bootstrapper = RuntimeBootstrapper::new();
     let mut enabled_plugins = Vec::new();
     let mut deployments = BTreeMap::new();
@@ -457,19 +530,18 @@ fn boot_core(config: &ServiceConfig, catalog: &PluginCatalog) -> ServiceRuntimeR
         }
     }
 
-    let profile = RuntimeProfile {
-        profile_id: config.service.profile.clone(),
-        mode: RuntimeProfileMode::ExtensibleRuntime,
-        enabled_plugins,
-        bindings: BTreeMap::new(),
-        plugin_deployments: deployments,
-        allow_dynamic_registration: false,
-        allow_hot_reload: true,
-    };
-    let mut host_config = HostRuntimeConfig::default();
-    host_config.worker_threads = config.core.worker_threads;
-    host_config.blocking_threads = config.core.blocking_threads;
-    Ok(bootstrapper.into_host_runtime_with_config(profile, host_config)?)
+    Ok((
+        bootstrapper,
+        RuntimeProfile {
+            profile_id: config.service.profile.clone(),
+            mode: RuntimeProfileMode::ExtensibleRuntime,
+            enabled_plugins,
+            bindings: BTreeMap::new(),
+            plugin_deployments: deployments,
+            allow_dynamic_registration: false,
+            allow_hot_reload: true,
+        },
+    ))
 }
 
 fn is_bootable_record(record: &PluginRecord) -> bool {
@@ -520,32 +592,74 @@ async fn start_supervised_sidecars(
     catalog: &PluginCatalog,
     supervisor: &RunnerSupervisor,
 ) {
-    for record in catalog.external_records() {
-        let Some(runtime) = &record.runtime else {
-            continue;
-        };
-        if runtime.runner_link == "jsonl-stdio" && !record.manifest.provides.runners.is_empty() {
-            continue;
-        }
-        let runner_id = record
-            .manifest
-            .provides
-            .runners
-            .first()
-            .map(|runner| runner.runner_id.clone())
-            .unwrap_or_else(|| format!("sidecar:{}", record.manifest.plugin_id));
-        let spec = ManagedRunnerSpec {
-            runner_id,
-            plugin_id: record.manifest.plugin_id.clone(),
-            runtime: runtime.clone(),
-            env_allowlist: config.runners.env_allowlist.clone(),
-            service_home: config.service.home_dir.clone(),
-            session_token: config.control_token().to_string(),
-        };
+    for spec in sidecar_specs(config, catalog) {
         if let Err(error) = supervisor.start(spec).await {
             tracing::error!(error = %error, "failed to start supervised runner");
         }
     }
+}
+
+async fn reconcile_supervised_sidecars(
+    desired: Vec<ManagedRunnerSpec>,
+    supervisor: &RunnerSupervisor,
+    graceful: Duration,
+) -> Vec<String> {
+    supervisor
+        .reconcile(desired, graceful)
+        .await
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect()
+}
+
+fn sidecar_specs(config: &ServiceConfig, catalog: &PluginCatalog) -> Vec<ManagedRunnerSpec> {
+    catalog
+        .external_records()
+        .filter_map(|record| {
+            let runtime = record.runtime.as_ref()?;
+            if runtime.runner_link == "jsonl-stdio" && !record.manifest.provides.runners.is_empty()
+            {
+                return None;
+            }
+            let runner_id = record
+                .manifest
+                .provides
+                .runners
+                .first()
+                .map(|runner| runner.runner_id.clone())
+                .unwrap_or_else(|| format!("sidecar:{}", record.manifest.plugin_id));
+            Some(ManagedRunnerSpec {
+                runner_id,
+                plugin_id: record.manifest.plugin_id.clone(),
+                runtime: runtime.clone(),
+                env_allowlist: config.runners.env_allowlist.clone(),
+                service_home: config.service.home_dir.clone(),
+                session_token: config.control_token().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn reload_drain_timeout(config: &ServiceConfig, catalog: &PluginCatalog) -> Duration {
+    let max_plugin_timeout = catalog
+        .records
+        .iter()
+        .filter(|record| record.enabled)
+        .map(|record| record.manifest.lifecycle.unload_timeout_ms)
+        .max()
+        .unwrap_or(0);
+    Duration::from_millis(config.runners.graceful_shutdown_ms.max(max_plugin_timeout))
+}
+
+fn surface_compatibility(compatibility: SurfaceCompatibility) -> String {
+    match compatibility {
+        SurfaceCompatibility::Identical => "identical",
+        SurfaceCompatibility::Additive => "additive",
+        SurfaceCompatibility::Deprecated => "deprecated",
+        SurfaceCompatibility::Removed => "removed",
+        SurfaceCompatibility::Breaking => "breaking",
+    }
+    .into()
 }
 
 fn to_control_runner_status(snapshots: Vec<RunnerSnapshot>) -> Vec<ControlRunnerStatus> {
@@ -721,7 +835,13 @@ fn runtime_failure(route: impl Into<String>, reason: impl Into<String>) -> Runti
 mod tests {
     use std::path::Path;
 
-    use mutsuki_service_control::{ConversationSendResponse, PluginCallParams};
+    use mutsuki_runtime_contracts::{
+        ArtifactType, LifecyclePolicy, PermissionGrant, PluginArtifact, PluginManifest,
+        PluginProvides,
+    };
+    use mutsuki_service_control::{
+        ConversationSendResponse, PluginCallParams, PluginReloadResponse,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -874,6 +994,115 @@ mod tests {
         assert_eq!(unsupported.error.expect("error").code, "unsupported");
     }
 
+    #[tokio::test]
+    async fn plugin_reload_requires_auth_and_swaps_generation() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+
+        let unauthorized = inner
+            .handle_request(ControlRequest {
+                token: "wrong".into(),
+                method: ControlMethod::PluginReload,
+                params: Value::Null,
+            })
+            .await;
+        assert!(!unauthorized.ok);
+        assert_eq!(unauthorized.error.expect("error").code, "unauthorized");
+
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginReload,
+                params: Value::Null,
+            })
+            .await;
+        assert!(response.ok);
+        let reload: PluginReloadResponse =
+            serde_json::from_value(response.result.expect("result")).expect("reload response");
+        assert_eq!(reload.previous_generation, 1);
+        assert_eq!(reload.registry_generation, 2);
+        assert_eq!(reload.plugin_count, 1);
+
+        let status = inner.core_status();
+        let status: CoreStatus =
+            serde_json::from_value(status.result.expect("status")).expect("core status");
+        assert_eq!(status.registry_generation, Some(2));
+    }
+
+    #[tokio::test]
+    async fn plugin_reload_failure_preserves_catalog_and_generation() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        std::fs::create_dir_all(dir.path().join("installed").join("bad")).expect("plugin dir");
+        std::fs::write(
+            dir.path().join("installed").join("bad").join("plugin.toml"),
+            "not valid toml",
+        )
+        .expect("write invalid manifest");
+
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginReload,
+                params: Value::Null,
+            })
+            .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.expect("error").code, "failed");
+
+        let status = inner.core_status();
+        let status: CoreStatus =
+            serde_json::from_value(status.result.expect("status")).expect("core status");
+        assert_eq!(status.registry_generation, Some(1));
+        let plugins = inner.plugin_list();
+        let plugins: Vec<PluginStatus> =
+            serde_json::from_value(plugins.result.expect("plugins")).expect("plugin list");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(
+            plugins[0].plugin_id,
+            mutsuki_service_plugin_conversation_sim::PLUGIN_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_list_reflects_catalog_after_successful_reload() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        let plugin_dir = dir.path().join("installed").join("dynamic");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        let plugin = mutsuki_service_plugin_loader::PluginToml {
+            manifest: minimal_manifest("mutsuki.dynamic.test"),
+            runtime: None,
+            enabled: Some(true),
+        };
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            toml::to_string(&plugin).expect("manifest toml"),
+        )
+        .expect("write manifest");
+
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginReload,
+                params: Value::Null,
+            })
+            .await;
+        assert!(response.ok);
+        let reload: PluginReloadResponse =
+            serde_json::from_value(response.result.expect("result")).expect("reload response");
+        assert_eq!(reload.plugin_count, 2);
+
+        let plugins = inner.plugin_list();
+        let plugins: Vec<PluginStatus> =
+            serde_json::from_value(plugins.result.expect("plugins")).expect("plugin list");
+        assert!(
+            plugins
+                .iter()
+                .any(|plugin| plugin.plugin_id == "mutsuki.dynamic.test")
+        );
+    }
+
     fn test_runtime_inner(token: &str) -> ServiceRuntimeInner {
         let mut config = ServiceConfig::default();
         config.ipc.token = Some(token.into());
@@ -888,10 +1117,58 @@ mod tests {
         ServiceRuntimeInner {
             config,
             started_at: Instant::now(),
-            catalog,
+            catalog: Mutex::new(catalog),
             host_runtime: Mutex::new(None),
             supervisor: RunnerSupervisor::new(),
             shutdown_tx: Mutex::new(None),
+        }
+    }
+
+    fn test_started_runtime_inner(token: &str, root: &Path) -> ServiceRuntimeInner {
+        let mut config = ServiceConfig::default();
+        config.ipc.token = Some(token.into());
+        config.service.home_dir = root.to_path_buf();
+        config.service.log_dir = root.join("logs");
+        config.service.run_dir = root.join("run");
+        config.plugins.builtin = vec![mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into()];
+        config.plugins.dynamic_dirs = vec![root.join("installed")];
+        config.plugins.disabled_dir = root.join("disabled");
+        let catalog = load_catalog(&config).expect("catalog");
+        let host_runtime = boot_core(&config, &catalog).expect("core");
+        ServiceRuntimeInner {
+            config,
+            started_at: Instant::now(),
+            catalog: Mutex::new(catalog),
+            host_runtime: Mutex::new(Some(host_runtime)),
+            supervisor: RunnerSupervisor::new(),
+            shutdown_tx: Mutex::new(None),
+        }
+    }
+
+    fn minimal_manifest(plugin_id: &str) -> PluginManifest {
+        PluginManifest {
+            plugin_id: plugin_id.into(),
+            version: "0.1.0".into(),
+            api_version: "mutsuki-plugin-v1".into(),
+            artifact: PluginArtifact {
+                artifact_type: ArtifactType::Native,
+                path: "native".into(),
+                sha256: "sha256:native".into(),
+            },
+            provides: PluginProvides::default(),
+            requires: Vec::new(),
+            permissions: PermissionGrant {
+                effects: Vec::new(),
+                resources: Vec::new(),
+            },
+            lifecycle: LifecyclePolicy {
+                reload_policy: "drain_and_swap".into(),
+                unload_timeout_ms: 100,
+                supports_cancel: true,
+                supports_dispose: true,
+                supports_snapshot: false,
+            },
+            metadata: BTreeMap::new(),
         }
     }
 }

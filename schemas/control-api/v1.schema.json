@@ -24,5 +24,40 @@
       ]
     },
     "params": true
+  },
+  "$defs": {
+    "pluginReloadResponse": {
+      "type": "object",
+      "required": [
+        "previous_generation",
+        "registry_generation",
+        "plugin_count",
+        "changes",
+        "runner_errors"
+      ],
+      "properties": {
+        "previous_generation": { "type": "integer", "minimum": 0 },
+        "registry_generation": { "type": "integer", "minimum": 0 },
+        "plugin_count": { "type": "integer", "minimum": 0 },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["surface_id", "compatibility"],
+            "properties": {
+              "surface_id": { "type": "string" },
+              "compatibility": {
+                "type": "string",
+                "enum": ["identical", "additive", "deprecated", "removed", "breaking"]
+              }
+            }
+          }
+        },
+        "runner_errors": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
   }
 }

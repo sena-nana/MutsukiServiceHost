@@ -54,7 +54,7 @@ pub struct PluginToml {
     pub enabled: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalRuntimeSpec {
     pub command: String,
     #[serde(default)]

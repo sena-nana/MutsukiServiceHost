@@ -31,7 +31,7 @@ pub enum RunnerSupervisorError {
 
 pub type RunnerSupervisorResult<T> = Result<T, RunnerSupervisorError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedRunnerSpec {
     pub runner_id: String,
     pub plugin_id: String,
@@ -143,6 +143,68 @@ impl RunnerSupervisor {
         stop_child(runner, Duration::from_secs(5)).await?;
         runner.state = RunnerProcessState::Stopped;
         Ok(())
+    }
+
+    pub async fn reconcile(
+        &self,
+        desired: Vec<ManagedRunnerSpec>,
+        graceful: Duration,
+    ) -> Vec<RunnerSupervisorError> {
+        let mut state = self.inner.lock().await;
+        let desired = desired
+            .into_iter()
+            .map(|spec| (spec.runner_id.clone(), spec))
+            .collect::<BTreeMap<_, _>>();
+        let mut errors = Vec::new();
+
+        for runner in state.runners.values_mut() {
+            refresh_runner(runner);
+        }
+
+        let existing_ids = state.runners.keys().cloned().collect::<Vec<_>>();
+        for runner_id in existing_ids {
+            let should_remove = !desired.contains_key(&runner_id);
+            let should_replace = desired
+                .get(&runner_id)
+                .is_some_and(|spec| state.runners[&runner_id].spec != *spec);
+            if !should_remove && !should_replace {
+                continue;
+            }
+            if let Some(runner) = state.runners.get_mut(&runner_id) {
+                if let Err(error) = stop_child(runner, graceful).await {
+                    errors.push(error);
+                    continue;
+                }
+            }
+            state.runners.remove(&runner_id);
+        }
+
+        for (runner_id, spec) in desired {
+            let needs_start = state
+                .runners
+                .get(&runner_id)
+                .is_none_or(|runner| !matches!(runner.state, RunnerProcessState::Running));
+            if !needs_start {
+                continue;
+            }
+            match spawn_child(&spec) {
+                Ok(child) => {
+                    state.runners.insert(
+                        runner_id,
+                        ManagedRunner {
+                            spec,
+                            child: Some(child),
+                            state: RunnerProcessState::Running,
+                            restarts: 0,
+                            last_error: None,
+                        },
+                    );
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+
+        errors
     }
 
     pub async fn shutdown(&self, graceful: Duration) {
@@ -260,5 +322,64 @@ fn snapshot_runner(runner: &ManagedRunner) -> RunnerSnapshot {
         pid: runner.child.as_ref().and_then(Child::id),
         restarts: runner.restarts,
         last_error: runner.last_error.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reconcile_keeps_running_specs_and_removes_missing_specs() {
+        let supervisor = RunnerSupervisor::new();
+        let spec = sleeping_spec("sidecar-a");
+
+        let errors = supervisor
+            .reconcile(vec![spec.clone()], Duration::from_millis(500))
+            .await;
+        assert!(errors.is_empty());
+        let first = supervisor.list().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].runner_id, "sidecar-a");
+        assert!(matches!(first[0].state, RunnerProcessState::Running));
+
+        let errors = supervisor
+            .reconcile(vec![spec], Duration::from_millis(500))
+            .await;
+        assert!(errors.is_empty());
+        let kept = supervisor.list().await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].runner_id, "sidecar-a");
+        assert_eq!(kept[0].restarts, 0);
+
+        let errors = supervisor
+            .reconcile(Vec::new(), Duration::from_millis(500))
+            .await;
+        assert!(errors.is_empty());
+        assert!(supervisor.list().await.is_empty());
+    }
+
+    fn sleeping_spec(runner_id: &str) -> ManagedRunnerSpec {
+        ManagedRunnerSpec {
+            runner_id: runner_id.into(),
+            plugin_id: "plugin-a".into(),
+            runtime: mutsuki_service_plugin_loader::ExternalRuntimeSpec {
+                command: "powershell".into(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 30".into(),
+                ],
+                env: BTreeMap::new(),
+                cwd: Option::<PathBuf>::None,
+                runner_link: "sidecar".into(),
+            },
+            env_allowlist: Vec::new(),
+            service_home: PathBuf::from("."),
+            session_token: "token".into(),
+        }
     }
 }
