@@ -30,6 +30,7 @@ crates/
   mutsuki-service-control           control request/response API
   mutsuki-service-ipc               named pipe / Unix socket / TCP debug transport
   mutsuki-service-observe           logging and panic hook
+  mutsuki-service-daemon            Windows Service installation and lifecycle
 ```
 
 ## Run
@@ -49,6 +50,18 @@ cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token stop
 ```
 
 If no token is configured, ServiceHost creates and reuses a local token in `<home>/run/control.token`.
+
+## Windows Service
+
+```powershell
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token install
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev start
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev uninstall
+```
+
+`install` creates an automatic Windows Service named from the configured instance id, such as
+`mutsuki-service-default`. If `--token` or `MUTSUKI_CONTROL_TOKEN` is used during installation,
+the token is stored in `<home>/run/control.token` and is not written into the service command line.
 
 ## Plugin Runtime
 

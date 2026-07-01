@@ -31,6 +31,8 @@ enum Command {
     Install,
     Uninstall,
     Start,
+    #[command(name = "windows-service-run", hide = true)]
+    WindowsServiceRun,
     #[command(subcommand)]
     Plugin(PluginCommand),
     #[command(subcommand)]
@@ -60,15 +62,22 @@ enum TaskCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let Cli {
+        profile,
+        config: config_file,
+        home,
+        token,
+        command,
+    } = Cli::parse();
+    let token_override = token.is_some();
     let config = ServiceConfig::load(ConfigOverrides {
-        profile: cli.profile,
-        config_file: cli.config,
-        home_dir: cli.home,
-        control_token: cli.token,
+        profile,
+        config_file: config_file.clone(),
+        home_dir: home,
+        control_token: token,
     })?;
 
-    match cli.command {
+    match command {
         Command::Run => {
             let runtime = mutsuki_service_runtime::ServiceRuntime::start(config).await?;
             runtime.run_foreground().await?;
@@ -85,9 +94,26 @@ async fn main() -> anyhow::Result<()> {
         Command::Health => {
             request_and_print(&config, ControlMethod::HealthCheck, Value::Null).await?
         }
-        Command::Install => unsupported_daemon("install")?,
-        Command::Uninstall => unsupported_daemon("uninstall")?,
-        Command::Start => unsupported_daemon("start")?,
+        Command::Install => {
+            let launch = mutsuki_service_daemon::DaemonLaunchOptions::from_config(
+                &config,
+                config_file,
+                token_override,
+            )?;
+            mutsuki_service_daemon::install(&config, &launch)?;
+            print_daemon_action("installed", &config);
+        }
+        Command::Uninstall => {
+            mutsuki_service_daemon::uninstall(&config)?;
+            print_daemon_action("uninstalled", &config);
+        }
+        Command::Start => {
+            mutsuki_service_daemon::start(&config)?;
+            print_daemon_action("started", &config);
+        }
+        Command::WindowsServiceRun => {
+            mutsuki_service_daemon::run_windows_service(config)?;
+        }
         Command::Plugin(command) => match command {
             PluginCommand::List => {
                 request_and_print(&config, ControlMethod::PluginList, Value::Null).await?
@@ -134,11 +160,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn unsupported_daemon(operation: &'static str) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "{operation} is not implemented for {} in ServiceHost 0.1.0; use foreground run mode",
-        std::env::consts::OS
-    )
+fn print_daemon_action(action: &str, config: &ServiceConfig) {
+    println!(
+        "{action} {}",
+        mutsuki_service_daemon::windows_service_name(config)
+    );
 }
 
 async fn request_and_print(

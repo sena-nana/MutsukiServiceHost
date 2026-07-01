@@ -6,6 +6,7 @@ members = [
     "crates/mutsuki-service-control",
     "crates/mutsuki-service-ipc",
     "crates/mutsuki-service-observe",
+    "crates/mutsuki-service-daemon",
     "crates/mutsuki-service-plugin-conversation-sim",
     "crates/mutsuki-service-plugin-terminal-tui",
     "crates/mutsuki-service-runtime",
@@ -35,6 +36,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+windows-service = "0.8.1"
 
 mutsuki-runtime-contracts = { path = "../NanoBot/crates/mutsuki-runtime-contracts" }
 mutsuki-runtime-core = { path = "../NanoBot/crates/mutsuki-runtime-core" }
@@ -47,6 +49,7 @@ mutsuki-service-runner-supervisor = { path = "crates/mutsuki-service-runner-supe
 mutsuki-service-control = { path = "crates/mutsuki-service-control" }
 mutsuki-service-ipc = { path = "crates/mutsuki-service-ipc" }
 mutsuki-service-observe = { path = "crates/mutsuki-service-observe" }
+mutsuki-service-daemon = { path = "crates/mutsuki-service-daemon" }
 mutsuki-service-plugin-conversation-sim = { path = "crates/mutsuki-service-plugin-conversation-sim" }
 mutsuki-service-plugin-terminal-tui = { path = "crates/mutsuki-service-plugin-terminal-tui" }
 mutsuki-service-runtime = { path = "crates/mutsuki-service-runtime" }

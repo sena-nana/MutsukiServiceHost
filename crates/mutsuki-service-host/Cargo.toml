@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-control.workspace = true
+mutsuki-service-daemon.workspace = true
 mutsuki-service-ipc.workspace = true
 mutsuki-service-runtime.workspace = true
 mutsuki-service-tui.workspace = true

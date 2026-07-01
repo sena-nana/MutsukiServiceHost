@@ -1,0 +1,14 @@
+[package]
+name = "mutsuki-service-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mutsuki-service-config.workspace = true
+mutsuki-service-runtime.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -98,20 +99,37 @@ impl ServiceRuntime {
         })
     }
 
-    pub async fn run_foreground(mut self) -> ServiceRuntimeResult<()> {
+    pub async fn run_foreground(self) -> ServiceRuntimeResult<()> {
+        let ctrl_c = async {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => "ctrl-c".to_string(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to listen for ctrl-c");
+                    "ctrl-c-listener-error".to_string()
+                }
+            }
+        };
+        self.run_until_shutdown_signal(ctrl_c).await
+    }
+
+    pub async fn run_until_shutdown_signal<F>(
+        mut self,
+        shutdown_signal: F,
+    ) -> ServiceRuntimeResult<()>
+    where
+        F: Future<Output = String>,
+    {
         let shutdown_rx = self
             .shutdown_rx
             .take()
             .ok_or(ServiceRuntimeError::AlreadyStarted)?;
+        tokio::pin!(shutdown_signal);
         tokio::select! {
             reason = shutdown_rx => {
                 tracing::info!(reason = ?reason, "service shutdown requested");
             }
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    tracing::warn!(error = %error, "failed to listen for ctrl-c");
-                }
-                tracing::info!("ctrl-c received");
+            reason = &mut shutdown_signal => {
+                tracing::info!(reason, "service shutdown signal received");
             }
         }
         self.shutdown().await;
