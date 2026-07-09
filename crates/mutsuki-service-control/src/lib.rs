@@ -33,6 +33,7 @@ pub enum ControlMethod {
     RunnerStop,
     TaskList,
     TaskCancel,
+    TaskOutcome,
     HealthCheck,
     LogTail,
 }
@@ -160,6 +161,18 @@ pub struct TaskFailureSummary {
     pub code: String,
     pub source: String,
     pub route: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskOutcomeView {
+    pub task_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

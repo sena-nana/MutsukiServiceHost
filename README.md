@@ -13,7 +13,15 @@ It owns the operating environment around the core:
 - structured logs, panic capture, and health aggregation
 - foreground daemon loop
 
-It deliberately does not implement Agent, Bot, QQBot, model provider, Python SDK, plugin marketplace, or GUI logic. Those belong in Core, plugins, runner kits, or UI hosts.
+It deliberately does not implement Agent, Bot, QQBot, model provider, Python SDK, plugin marketplace,
+or GUI/business logic. Those belong in Core, StdPlugins, runner kits, or UI hosts.
+
+Optional compile-time host facades:
+
+- `mutsuki.conversation.sim` — **dev/mock** conversation control facade (in-memory turns only; not long-term ServiceHost business state)
+- `mutsuki.terminal.tui` — **UI host feature** for the local terminal client; not a runtime effect plugin
+
+Runtime crates are consumed from the sibling `MutsukiCore` workspace (`../MutsukiCore/crates/...`).
 
 ## Workspace
 
@@ -23,8 +31,8 @@ crates/
   mutsuki-service-runtime           service lifecycle and Core bootstrap
   mutsuki-service-config            config/profile/path/token loading
   mutsuki-service-plugin-loader     plugin.toml discovery and validation
-  mutsuki-service-plugin-conversation-sim optional simulated conversation plugin
-  mutsuki-service-plugin-terminal-tui     optional terminal TUI support plugin
+  mutsuki-service-plugin-conversation-sim optional **dev/mock** conversation control facade
+  mutsuki-service-plugin-terminal-tui     optional **UI host feature** for local TUI attachment
   mutsuki-service-tui               terminal client library
   mutsuki-service-runner-supervisor external process supervision
   mutsuki-service-control           control request/response API
@@ -75,11 +83,17 @@ env = {}
 runner_link = "jsonl-stdio"
 ```
 
-`jsonl-stdio` runners are launched and registered with Core as external runners. Sidecar processes without Core runner descriptors are supervised by the runner supervisor and exposed through the control API.
+`jsonl-stdio` runners are launched by ServiceHost, wrapped with `mutsuki-runtime-host::JsonlRunner`,
+and registered with Core as external runners (`runner.run_batch`). Sidecar processes without Core
+runner descriptors are supervised by the runner supervisor and exposed through the control API.
 
-The default binary also links optional builtin host plugins for terminal conversation simulation.
-Enable `mutsuki.conversation.sim` and `mutsuki.terminal.tui` in `[plugins].builtin`, then attach with
-`mutsuki-service tui`.
+The default binary also links optional host facades for local terminal conversation simulation.
+These are **not** ServiceHost runtime business capabilities:
+
+- `mutsuki.conversation.sim` — dev/mock control facade
+- `mutsuki.terminal.tui` — UI host feature for `mutsuki-service tui`
+
+Enable them in `[plugins].builtin`, then attach with `mutsuki-service tui`.
 
 ## Validation
 

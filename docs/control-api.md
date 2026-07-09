@@ -33,6 +33,7 @@ Error:
 - `runner_stop`
 - `task_list`
 - `task_cancel`
+- `task_outcome`
 - `health_check`
 - `log_tail`
 
@@ -40,6 +41,10 @@ Unsupported methods are intentionally explicit where the current Core host API h
 
 `task_list` returns live operational snapshots from the host runtime. Task payloads and detailed
 runtime error evidence are intentionally omitted from the control response.
+
+Control responses keep string `task_id` fields for clients. Internally, `task_cancel` and
+`task_outcome` reconstruct a Core `TaskHandle` from live task snapshots before calling
+`HostRuntimeCommand::CancelTask` / `TaskOutcome`.
 
 Successful task list response:
 
@@ -85,11 +90,26 @@ Successful reload response:
 }
 ```
 
-`plugin_call` dispatches to loaded builtin host plugins:
+`plugin_call` dispatches to loaded host control facades. These facades are not a parallel business
+runtime path; Core task/resource work must go through `HostContext`.
 
 ```json
 {"plugin_id":"mutsuki.conversation.sim","operation":"send","payload":{"message":"hello"}}
 ```
+
+`task_outcome` returns a control-plane view of Core `TaskOutcome` for a task id:
+
+```json
+{"id":"task-1"}
+```
+
+Successful outcome response:
+
+```json
+{"task_id":"task-1","status":"cancelled","output_ref":null,"reason":null,"error_code":null}
+```
+
+Non-terminal tasks return `"status":"pending"`.
 
 `log_tail` reads the configured service log file and returns `{ "cursor": 0, "entries": [] }`.
 Pass the returned cursor on the next request for incremental reads. Filters are rejected until a

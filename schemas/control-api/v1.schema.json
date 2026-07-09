@@ -19,6 +19,7 @@
         "runner_stop",
         "task_list",
         "task_cancel",
+        "task_outcome",
         "health_check",
         "log_tail"
       ]

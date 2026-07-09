@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mutsuki_runtime_contracts::{
-    PluginDeploymentKind, RunnerContext, RunnerDescriptor, RunnerResult, RuntimeProfile,
-    RuntimeProfileMode, SurfaceCompatibility, Task, TaskStatus,
+    CancelPolicy, PluginDeploymentKind, RunnerDescriptor, RuntimeProfile, RuntimeProfileMode,
+    SurfaceCompatibility, TaskHandle, TaskOutcome, TaskStatus,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 use mutsuki_runtime_host::{
-    HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostTaskSnapshot, RuntimeBootstrapper,
+    HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
+    JsonlRunner, RuntimeBootstrapper,
 };
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
@@ -19,7 +22,8 @@ use mutsuki_service_control::{
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
     PluginCallParams, PluginReloadChange, PluginReloadResponse, PluginStatus,
     RunnerStatus as ControlRunnerStatus, ServiceStatus,
-    TaskFailureSummary as ControlTaskFailureSummary, TaskSnapshot as ControlTaskSnapshot,
+    TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
+    TaskSnapshot as ControlTaskSnapshot,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -29,7 +33,7 @@ use mutsuki_service_plugin_loader::{
 use mutsuki_service_runner_supervisor::{
     ManagedRunnerSpec, RunnerProcessState, RunnerSnapshot, RunnerSupervisor,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 #[derive(Debug, thiserror::Error)]
@@ -181,6 +185,7 @@ impl ServiceRuntimeInner {
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
             ControlMethod::TaskList => self.task_list(),
             ControlMethod::TaskCancel => self.task_cancel(request.params),
+            ControlMethod::TaskOutcome => self.task_outcome(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
         }
@@ -325,6 +330,7 @@ impl ServiceRuntimeInner {
                 params.plugin_id
             )));
         };
+        // HostPlugin is a control-plane facade only; Core task/resource work must use HostContext.
         match plugin.call(&params.operation, params.payload) {
             Ok(value) => ControlResponse::ok(value),
             Err(HostPluginCallError::UnsupportedOperation(operation)) => ControlResponse::err(
@@ -386,8 +392,36 @@ impl ServiceRuntimeInner {
         let Some(runtime) = guard.as_mut() else {
             return ControlResponse::err(ControlError::Failed("core is not running".into()));
         };
-        match runtime.dispatch(HostRuntimeCommand::CancelTask(param.id)) {
+        let handle = match resolve_task_handle(runtime, &param.id) {
+            Ok(handle) => handle,
+            Err(error) => return ControlResponse::err(error),
+        };
+        match runtime.dispatch(HostRuntimeCommand::CancelTask(handle)) {
             Ok(_) => ControlResponse::empty_ok(),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn task_outcome(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<IdParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        let mut guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_mut() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        let handle = match resolve_task_handle(runtime, &param.id) {
+            Ok(handle) => handle,
+            Err(error) => return ControlResponse::err(error),
+        };
+        match runtime.dispatch(HostRuntimeCommand::TaskOutcome(handle.clone())) {
+            Ok(HostRuntimeReply::TaskOutcome(outcome)) => {
+                ControlResponse::ok(to_control_task_outcome(&handle.task_id, outcome))
+            }
+            Ok(other) => ControlResponse::err(ControlError::Failed(format!(
+                "unexpected task outcome reply: {other:?}"
+            ))),
             Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
         }
     }
@@ -528,15 +562,18 @@ fn runtime_bootstrapper(
         if !record.enabled {
             continue;
         }
-        if is_bootable_record(record) {
-            bootstrapper.register_manifest(record.manifest.clone());
-            enabled_plugins.push(record.manifest.plugin_id.clone());
-            let deployment =
-                PluginDeploymentKind::default_for_artifact(&record.manifest.artifact.artifact_type);
-            deployments.insert(record.manifest.plugin_id.clone(), deployment.clone());
-            if let Some(runtime) = &record.runtime {
-                register_stdio_runners(config, &mut bootstrapper, record, runtime, deployment)?;
-            }
+        if !is_bootable_record(record) {
+            continue;
+        }
+
+        let deployment =
+            PluginDeploymentKind::default_for_artifact(&record.manifest.artifact.artifact_type);
+        deployments.insert(record.manifest.plugin_id.clone(), deployment.clone());
+        enabled_plugins.push(record.manifest.plugin_id.clone());
+        bootstrapper.register_manifest(record.manifest.clone());
+
+        if let Some(runtime) = &record.runtime {
+            register_stdio_runners(config, &mut bootstrapper, record, runtime, deployment)?;
         }
     }
 
@@ -577,7 +614,7 @@ fn register_stdio_runners(
         });
     }
     for descriptor in &record.manifest.provides.runners {
-        let runner = StdioJsonlRunner::spawn(
+        let runner = OwnedJsonlRunner::spawn(
             descriptor.clone(),
             runtime.clone(),
             config.runners.env_allowlist.clone(),
@@ -722,6 +759,56 @@ fn to_control_task_snapshots(snapshots: Vec<HostTaskSnapshot>) -> Vec<ControlTas
         .collect()
 }
 
+fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskOutcomeView {
+    match outcome {
+        None => TaskOutcomeView {
+            task_id: task_id.into(),
+            status: "pending".into(),
+            output_ref: None,
+            reason: None,
+            error_code: None,
+        },
+        Some(TaskOutcome::Completed {
+            task_id,
+            output_ref,
+        }) => TaskOutcomeView {
+            task_id,
+            status: "completed".into(),
+            output_ref,
+            reason: None,
+            error_code: None,
+        },
+        Some(TaskOutcome::Failed { task_id, error }) => TaskOutcomeView {
+            task_id,
+            status: "failed".into(),
+            output_ref: None,
+            reason: Some(error.route.clone()),
+            error_code: Some(error.code),
+        },
+        Some(TaskOutcome::Cancelled { task_id, reason }) => TaskOutcomeView {
+            task_id,
+            status: "cancelled".into(),
+            output_ref: None,
+            reason,
+            error_code: None,
+        },
+        Some(TaskOutcome::Expired { task_id, reason }) => TaskOutcomeView {
+            task_id,
+            status: "expired".into(),
+            output_ref: None,
+            reason,
+            error_code: None,
+        },
+        Some(TaskOutcome::DeadLetter { task_id, reason }) => TaskOutcomeView {
+            task_id,
+            status: "dead_letter".into(),
+            output_ref: None,
+            reason,
+            error_code: None,
+        },
+    }
+}
+
 fn task_status_name(status: &TaskStatus) -> &'static str {
     match status {
         TaskStatus::Created => "created",
@@ -737,15 +824,38 @@ fn task_status_name(status: &TaskStatus) -> &'static str {
     }
 }
 
-struct StdioJsonlRunner {
-    descriptor: RunnerDescriptor,
-    child: Child,
-    reader: BufReader<ChildStdout>,
-    writer: ChildStdin,
-    next_request: u64,
+fn resolve_task_handle(
+    runtime: &mut HostRuntime,
+    task_id: &str,
+) -> Result<TaskHandle, ControlError> {
+    let snapshots = runtime
+        .task_snapshots()
+        .map_err(|error| ControlError::Failed(error.to_string()))?;
+    let Some(snapshot) = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.task_id == task_id)
+    else {
+        return Err(ControlError::Failed(format!(
+            "task {task_id} was not found"
+        )));
+    };
+    Ok(TaskHandle {
+        task_id: snapshot.task_id,
+        protocol_id: snapshot.protocol_id,
+        target_binding_id: snapshot.target_binding_id,
+        cancel_policy: CancelPolicy::Cascade,
+        trace_id: snapshot.trace_id,
+        correlation_id: snapshot.correlation_id,
+    })
 }
 
-impl StdioJsonlRunner {
+/// Owns an external JSONL stdio child and delegates protocol to Core `JsonlRunner`.
+struct OwnedJsonlRunner {
+    child: Child,
+    inner: JsonlRunner<BufReader<std::process::ChildStdout>, std::process::ChildStdin>,
+}
+
+impl OwnedJsonlRunner {
     fn spawn(
         descriptor: RunnerDescriptor,
         runtime: ExternalRuntimeSpec,
@@ -782,80 +892,33 @@ impl StdioJsonlRunner {
             std::thread::spawn(move || drain_blocking_stderr(runner_id, stderr));
         }
         Ok(Self {
-            descriptor,
             child,
-            reader: BufReader::new(stdout),
-            writer: stdin,
-            next_request: 0,
+            inner: JsonlRunner::new(descriptor, BufReader::new(stdout), stdin),
         })
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> RuntimeResult<Value> {
-        self.next_request += 1;
-        let id = format!("req-{}", self.next_request);
-        let request = json!({"id": id, "method": method, "params": params});
-        serde_json::to_writer(&mut self.writer, &request).map_err(jsonl_failure)?;
-        self.writer.write_all(b"\n").map_err(io_failure)?;
-        self.writer.flush().map_err(io_failure)?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(io_failure)?;
-        if line.trim().is_empty() {
-            return Err(runtime_failure("jsonl.protocol", "empty response"));
-        }
-        let response: Value = serde_json::from_str(&line).map_err(jsonl_failure)?;
-        if response.get("id") != Some(&Value::String(id)) {
-            return Err(runtime_failure("jsonl.protocol", "response id mismatch"));
-        }
-        match response.get("ok").and_then(Value::as_bool) {
-            Some(true) => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
-            Some(false) => {
-                let error_value = response
-                    .get("error")
-                    .cloned()
-                    .ok_or_else(|| runtime_failure("jsonl.protocol", "missing error"))?;
-                let error = serde_json::from_value(error_value).map_err(jsonl_failure)?;
-                Err(RuntimeFailure::new(error))
-            }
-            None => Err(runtime_failure("jsonl.protocol", "missing ok flag")),
-        }
     }
 }
 
-impl Runner for StdioJsonlRunner {
+impl Runner for OwnedJsonlRunner {
     fn descriptor(&self) -> &RunnerDescriptor {
-        &self.descriptor
+        Runner::descriptor(&self.inner)
     }
 
-    fn step(&mut self, ctx: RunnerContext, tasks: Vec<Task>) -> RuntimeResult<Vec<RunnerResult>> {
-        let result = self.request(
-            "runner.step",
-            json!({
-                "runner_id": self.descriptor.runner_id,
-                "ctx": ctx,
-                "tasks": tasks,
-            }),
-        )?;
-        serde_json::from_value(result).map_err(jsonl_failure)
+    fn run_batch(
+        &mut self,
+        ctx: mutsuki_runtime_contracts::RunnerContext,
+        batch: mutsuki_runtime_contracts::WorkBatch,
+    ) -> RuntimeResult<mutsuki_runtime_contracts::CompletionBatch> {
+        self.inner.run_batch(ctx, batch)
     }
 
     fn cancel(&mut self, invocation_id: &str) -> RuntimeResult<()> {
-        self.request(
-            "runner.cancel",
-            json!({
-                "runner_id": self.descriptor.runner_id,
-                "invocation_id": invocation_id,
-            }),
-        )?;
-        Ok(())
+        self.inner.cancel(invocation_id)
     }
 
     fn dispose(&mut self) -> RuntimeResult<()> {
-        self.request(
-            "runner.dispose",
-            json!({"runner_id": self.descriptor.runner_id}),
-        )?;
+        let result = self.inner.dispose();
         let _ = self.child.kill();
-        Ok(())
+        result
     }
 }
 
@@ -866,37 +929,17 @@ fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {
     }
 }
 
-fn io_failure(error: std::io::Error) -> RuntimeFailure {
-    runtime_failure("jsonl.io", error.to_string())
-}
-
-fn jsonl_failure(error: serde_json::Error) -> RuntimeFailure {
-    runtime_failure("jsonl.decode", error.to_string())
-}
-
-fn runtime_failure(route: impl Into<String>, reason: impl Into<String>) -> RuntimeFailure {
-    let mut error = mutsuki_runtime_contracts::RuntimeError::new(
-        mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
-        "mutsuki_service_host",
-        route,
-    );
-    error.evidence.insert(
-        "reason".into(),
-        mutsuki_runtime_contracts::ScalarValue::String(reason.into()),
-    );
-    RuntimeFailure::new(error)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use mutsuki_runtime_contracts::{
         ArtifactType, LifecyclePolicy, PermissionGrant, PluginArtifact, PluginManifest,
-        PluginProvides,
+        PluginProvides, Task,
     };
     use mutsuki_service_control::{
-        ConversationSendResponse, PluginCallParams, PluginReloadResponse, TaskSnapshot,
+        ConversationSendResponse, PluginCallParams, PluginReloadResponse, TaskOutcomeView,
+        TaskSnapshot,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -1092,6 +1135,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_cancel_and_outcome_use_task_handle() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        {
+            let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
+            let runtime = guard.as_mut().expect("runtime started");
+            runtime
+                .dispatch(HostRuntimeCommand::SubmitTask(Box::new(Task::new(
+                    "cancel-task-1",
+                    "control.input",
+                    json!({}),
+                ))))
+                .expect("submit task");
+        }
+
+        let cancel = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskCancel,
+                params: json!({ "id": "cancel-task-1" }),
+            })
+            .await;
+        assert!(cancel.ok);
+
+        let outcome = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskOutcome,
+                params: json!({ "id": "cancel-task-1" }),
+            })
+            .await;
+        assert!(outcome.ok);
+        let view: TaskOutcomeView =
+            serde_json::from_value(outcome.result.expect("result")).expect("outcome");
+        assert_eq!(view.task_id, "cancel-task-1");
+        assert_eq!(view.status, "cancelled");
+    }
+
+    #[test]
+    fn service_host_uses_jsonl_run_batch_not_step() {
+        use std::io::Cursor;
+
+        use mutsuki_runtime_contracts::{
+            BatchEntry, BatchPayload, CompletionBatch, DispatchLane, EntryCompletion,
+            OrderingRequirement, RunnerContext, RunnerResult, TaskLease, WorkBatch,
+            WorkResourcePlan,
+        };
+
+        let descriptor = RunnerDescriptor {
+            runner_id: "jsonl.test".into(),
+            plugin_id: "plugin.test".into(),
+            plugin_generation: 1,
+            accepted_protocol_ids: vec!["raw.input".into()],
+            purity: mutsuki_runtime_contracts::RunnerPurity::Pure,
+            execution_class: mutsuki_runtime_contracts::ExecutionClass::Cpu,
+            input_schema: json!({}),
+            output_schema: json!({}),
+            batch: Default::default(),
+            payload: Default::default(),
+            resources: Default::default(),
+            ordering: Default::default(),
+            control: Default::default(),
+            metadata: BTreeMap::new(),
+            contract_surfaces: vec!["runner:jsonl.test".into()],
+        };
+        let mut task = Task::new("task-1", "raw.input", json!({}));
+        task.lease_id = Some("lease-1".into());
+        let batch = WorkBatch {
+            batch_id: "batch-1".into(),
+            tick_id: "tick-1".into(),
+            batch_key: "jsonl.test".into(),
+            entries: vec![BatchEntry {
+                entry_id: "task-1".into(),
+                task_id: "task-1".into(),
+                trace_id: None,
+                parent_id: None,
+                payload_index: 0,
+                resource_requirement_indices: Vec::new(),
+                cancel_index: Some(0),
+                deadline_tick: None,
+                priority: 0,
+                lane: DispatchLane::Normal,
+                ordering: OrderingRequirement::None,
+            }],
+            payload: BatchPayload::from_tasks(&[task.clone()]),
+            resource_plan: WorkResourcePlan::empty(),
+            task_leases: vec![TaskLease {
+                lease_id: "lease-1".into(),
+                task_id: "task-1".into(),
+                runner_id: "jsonl.test".into(),
+                executor_id: "executor:test".into(),
+                registry_generation: 1,
+                acquired_at_step: 1,
+                expires_at_step: None,
+            }],
+        };
+        let completion = CompletionBatch {
+            batch_id: "batch-1".into(),
+            tick_id: "tick-1".into(),
+            results: vec![EntryCompletion {
+                entry_id: "task-1".into(),
+                task_id: "task-1".into(),
+                result: Some(RunnerResult::completed("task-1")),
+                error: None,
+            }],
+            metadata: Vec::new(),
+        };
+        let response = format!("{}\n", json!({"id":"req-1","ok":true,"result": completion}));
+        let reader = Cursor::new(response.into_bytes());
+        let writer = Cursor::new(Vec::<u8>::new());
+        let mut runner = JsonlRunner::new(descriptor, reader, writer);
+        let result = runner
+            .run_batch(
+                RunnerContext::new(
+                    1,
+                    1,
+                    "executor:test",
+                    Some("lease-1".into()),
+                    "invocation:test",
+                ),
+                batch,
+            )
+            .expect("run_batch");
+        let (_reader, writer) = runner.into_inner();
+        let request = String::from_utf8(writer.into_inner()).expect("utf8");
+        assert_eq!(result.batch_id, "batch-1");
+        assert!(request.contains("\"method\":\"runner.run_batch\""));
+        assert!(request.contains("\"batch\":"));
+        assert!(!request.contains("\"method\":\"runner.step\""));
+    }
+
+    #[tokio::test]
     async fn plugin_reload_requires_auth_and_swaps_generation() {
         let dir = tempdir().expect("temp dir");
         let inner = test_started_runtime_inner("token", dir.path());
@@ -1124,6 +1299,15 @@ mod tests {
         let status: CoreStatus =
             serde_json::from_value(status.result.expect("status")).expect("core status");
         assert_eq!(status.registry_generation, Some(2));
+        let guard = inner.host_runtime.lock().expect("host runtime mutex");
+        assert_eq!(
+            guard
+                .as_ref()
+                .expect("runtime")
+                .host_context()
+                .registry_generation(),
+            2
+        );
     }
 
     #[tokio::test]

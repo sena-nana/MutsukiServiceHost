@@ -93,6 +93,7 @@ impl HostPlugin for ConversationSimPlugin {
     }
 
     fn call(&self, operation: &str, payload: Value) -> HostPluginCallResult<Value> {
+        // Dev/mock control facade: in-memory turns only, not ServiceHost business state.
         match operation {
             "send" => self.send(payload),
             "history" => self.history(),
@@ -113,7 +114,7 @@ fn manifest() -> PluginManifest {
         api_version: "mutsuki-plugin-v1".into(),
         artifact: PluginArtifact {
             artifact_type: ArtifactType::Native,
-            path: "<builtin>".into(),
+            path: "<builtin-dev-mock>".into(),
             sha256: String::new(),
         },
         provides: PluginProvides {

@@ -25,10 +25,10 @@ The service host does not own task scheduling. Core remains the source of truth 
 - Core bootstrap with an extensible runtime profile.
 - Builtin registry boundary. Real builtin plugin crates must be linked and registered explicitly; unavailable builtin names fail startup.
 - `plugin.toml` scanning from configured plugin directories.
-- JSONL stdio external runners registered with Core.
+- JSONL stdio external runners registered with Core via `JsonlRunner::run_batch`.
 - Sidecar process supervision for external runtimes that do not expose Core runner descriptors.
 - Local control API over Windows named pipe, Unix socket, or explicit TCP debug transport.
-- Authenticated service status, core status, plugin list, runner list/restart/stop, task list/cancel, health, shutdown.
+- Authenticated service status, core status, plugin list, runner list/restart/stop, task list/cancel/outcome, health, shutdown.
 - Authenticated plugin reload with manifest rescan, Core generation drain/swap, catalog replacement, and sidecar reconciliation.
 - Windows Service install, uninstall, start, and SCM stop handling.
 

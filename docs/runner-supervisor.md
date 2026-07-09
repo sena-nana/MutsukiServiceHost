@@ -11,4 +11,7 @@ Implemented behavior:
 - restart and stop by runner id
 - graceful shutdown before service exit
 
-Core-connected `jsonl-stdio` runners are owned by the Core runner adapter so task execution can synchronously call `runner.step`, `runner.cancel`, and `runner.dispose`.
+Core-connected `jsonl-stdio` runners are spawned by ServiceHost and registered with Core through
+`mutsuki-runtime-host::JsonlRunner`. Task execution calls `runner.run_batch`, `runner.cancel`, and
+`runner.dispose` over JSONL stdio (`{ ctx, batch }` -> `CompletionBatch`). ServiceHost does not
+implement the obsolete `Runner::step` / `runner.step` path.

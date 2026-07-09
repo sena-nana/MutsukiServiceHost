@@ -26,6 +26,7 @@ impl HostPlugin for TerminalTuiPlugin {
     }
 
     fn call(&self, operation: &str, _payload: Value) -> HostPluginCallResult<Value> {
+        // UI host feature facade — not a runtime effect plugin.
         match operation {
             "status" => serde_json::to_value(TerminalTuiStatus {
                 available: true,
@@ -45,7 +46,7 @@ fn manifest() -> PluginManifest {
         api_version: "mutsuki-plugin-v1".into(),
         artifact: PluginArtifact {
             artifact_type: ArtifactType::Native,
-            path: "<builtin>".into(),
+            path: "<builtin-ui-host-feature>".into(),
             sha256: String::new(),
         },
         provides: PluginProvides {

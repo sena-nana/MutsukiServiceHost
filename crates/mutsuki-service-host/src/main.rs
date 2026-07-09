@@ -58,6 +58,7 @@ enum RunnerCommand {
 enum TaskCommand {
     List,
     Cancel { id: String },
+    Outcome { id: String },
 }
 
 #[tokio::main]
@@ -151,6 +152,14 @@ async fn main() -> anyhow::Result<()> {
                 request_and_print(
                     &config,
                     ControlMethod::TaskCancel,
+                    serde_json::to_value(IdParam { id })?,
+                )
+                .await?
+            }
+            TaskCommand::Outcome { id } => {
+                request_and_print(
+                    &config,
+                    ControlMethod::TaskOutcome,
                     serde_json::to_value(IdParam { id })?,
                 )
                 .await?

@@ -92,6 +92,8 @@ pub struct BuiltinSelection {
     pub host_plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
 
+/// Control-plane facade for host-linked plugins (not a parallel business runtime path).
+/// Callers must route through Core `HostContext`; plugins must not register capabilities at call time.
 pub trait HostPlugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
     fn call(&self, operation: &str, payload: Value) -> HostPluginCallResult<Value>;

@@ -20,15 +20,19 @@ cwd = "optional-working-directory"
 runner_link = "jsonl-stdio"
 ```
 
-`jsonl-stdio` is the first Core-connected runner link. Other external processes can still be supervised as sidecars, but they are not advertised to Core as executable runners.
+`jsonl-stdio` is the first Core-connected runner link. ServiceHost wraps the child process with
+`mutsuki-runtime-host::JsonlRunner` (`runner.run_batch`). Other external processes can still be
+supervised as sidecars, but they are not advertised to Core as executable runners.
 
-Builtin host plugins are linked at compile time and enabled through `[plugins].builtin`.
+Builtin host facades are linked at compile time and enabled through `[plugins].builtin`.
 The default ServiceHost build links:
 
-- `mutsuki.conversation.sim`
-- `mutsuki.terminal.tui`
+- `mutsuki.conversation.sim` — **dev/mock** conversation control facade (not long-term business state)
+- `mutsuki.terminal.tui` — **UI host feature** for the local terminal client (not a runtime effect plugin)
 
 If a requested builtin was not linked into the binary, startup fails with `BuiltinUnavailable`.
+
+`HostPlugin` remains a control-plane facade and must not become a parallel business runtime path.
 
 `plugin_reload` uses the same loader path as startup. The host rescans and validates manifests,
 prepares a new Core load-plan generation, drains active runtime work, swaps Core through

@@ -17,11 +17,14 @@
 - `core.status`
 - `plugin.list`
 - `plugin.reload`
+- `plugin.call`（控制面 facade，不是并行业务 runtime 路径）
 - `runner.list`
 - `runner.restart`
 - `runner.stop`
 - `task.list`
-- `task.cancel`
+- `task.cancel`（内部使用 `TaskHandle`）
+- `task.outcome`（内部使用 `TaskHandle`）
 - `health.check`
+- `log.tail`
 
 所有请求必须携带 control token，除非显式处于测试模式。

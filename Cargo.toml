@@ -38,10 +38,10 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 windows-service = "0.8.1"
 
-mutsuki-runtime-contracts = { path = "../NanoBot/crates/mutsuki-runtime-contracts" }
-mutsuki-runtime-core = { path = "../NanoBot/crates/mutsuki-runtime-core" }
-mutsuki-runtime-host = { path = "../NanoBot/crates/mutsuki-runtime-host" }
-mutsuki-runtime-sdk = { path = "../NanoBot/crates/mutsuki-runtime-sdk" }
+mutsuki-runtime-contracts = { path = "../MutsukiCore/crates/mutsuki-runtime-contracts" }
+mutsuki-runtime-core = { path = "../MutsukiCore/crates/mutsuki-runtime-core" }
+mutsuki-runtime-host = { path = "../MutsukiCore/crates/mutsuki-runtime-host" }
+mutsuki-runtime-sdk = { path = "../MutsukiCore/crates/mutsuki-runtime-sdk" }
 
 mutsuki-service-config = { path = "crates/mutsuki-service-config" }
 mutsuki-service-plugin-loader = { path = "crates/mutsuki-service-plugin-loader" }
