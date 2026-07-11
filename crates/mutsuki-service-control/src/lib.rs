@@ -257,33 +257,3 @@ pub struct PluginCallParams {
     #[serde(default)]
     pub payload: Value,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationTurn {
-    pub sequence: u64,
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConversationSendParams {
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationSendResponse {
-    pub reply: ConversationTurn,
-    pub turns: Vec<ConversationTurn>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationHistoryResponse {
-    pub turns: Vec<ConversationTurn>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TerminalTuiStatus {
-    pub available: bool,
-    pub renderer: String,
-    pub conversation_plugin_id: String,
-}

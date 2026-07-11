@@ -17,12 +17,8 @@ It owns the operating environment around the core:
 It deliberately does not implement Agent, Bot, QQBot, model provider, Python SDK, plugin marketplace,
 or GUI/business logic. Those belong in Core, StdPlugins, runner kits, or UI hosts.
 
-Optional compile-time host facades:
-
-- `mutsuki.conversation.sim` — **dev/mock** conversation control facade (in-memory turns only; not long-term ServiceHost business state)
-- `mutsuki.terminal.tui` — **UI host feature** for the local terminal client; not a runtime effect plugin
-
 Runtime crates are consumed from the sibling `MutsukiCore` workspace (`../MutsukiCore/crates/...`).
+The interactive terminal client lives in the separate `MutsukiCliHost` repository.
 
 ## Workspace
 
@@ -32,9 +28,6 @@ crates/
   mutsuki-service-runtime           service lifecycle and Core bootstrap
   mutsuki-service-config            config/profile/path/token loading
   mutsuki-service-plugin-loader     plugin.toml discovery and validation
-  mutsuki-service-plugin-conversation-sim optional **dev/mock** conversation control facade
-  mutsuki-service-plugin-terminal-tui     optional **UI host feature** for local TUI attachment
-  mutsuki-service-tui               terminal client library
   mutsuki-service-runner-supervisor external process supervision
   mutsuki-service-control           control request/response API
   mutsuki-service-ipc               named pipe / Unix socket / TCP debug transport
@@ -55,7 +48,6 @@ cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token statu
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token health
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin list
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token event-source list
-cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token tui
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token stop
 ```
 
@@ -89,13 +81,8 @@ runner_link = "jsonl-stdio"
 and registered with Core as external runners (`runner.run_batch`). Sidecar processes without Core
 runner descriptors are supervised by the runner supervisor and exposed through the control API.
 
-The default binary also links optional host facades for local terminal conversation simulation.
-These are **not** ServiceHost runtime business capabilities:
-
-- `mutsuki.conversation.sim` — dev/mock control facade
-- `mutsuki.terminal.tui` — UI host feature for `mutsuki-service tui`
-
-Enable them in `[plugins].builtin`, then attach with `mutsuki-service tui`.
+ServiceHost does not link development, conversation, or UI plugins. Product binaries may register
+real builtin crates through `ServiceRuntimeBuilder`; missing upstream capabilities remain unavailable.
 
 ## Validation
 

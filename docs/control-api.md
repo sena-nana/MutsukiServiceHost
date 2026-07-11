@@ -102,10 +102,6 @@ The generic CLI exposes the same authenticated operations as
 `plugin_call` dispatches to loaded host control facades. These facades are not a parallel business
 runtime path; Core task/resource work must go through `HostContext`.
 
-```json
-{"plugin_id":"mutsuki.conversation.sim","operation":"send","payload":{"message":"hello"}}
-```
-
 `task_outcome` returns a control-plane view of Core `TaskOutcome` for a task id:
 
 ```json

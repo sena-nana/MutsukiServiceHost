@@ -750,13 +750,7 @@ fn load_catalog(
 }
 
 fn builtin_registry() -> BuiltinRegistry {
-    #[allow(unused_mut)]
-    let mut registry = BuiltinRegistry::new();
-    #[cfg(feature = "conversation-sim")]
-    registry.register(mutsuki_service_plugin_conversation_sim::plugin());
-    #[cfg(feature = "terminal-tui")]
-    registry.register(mutsuki_service_plugin_terminal_tui::plugin());
-    registry
+    BuiltinRegistry::new()
 }
 
 fn read_log_tail(
@@ -1220,13 +1214,47 @@ mod tests {
     };
     use mutsuki_runtime_sdk::map_work_batch_entries;
     use mutsuki_service_control::{
-        ConversationSendResponse, PluginCallParams, PluginReloadResponse, TaskOutcomeView,
-        TaskSnapshot,
+        PluginCallParams, PluginReloadResponse, TaskOutcomeView, TaskSnapshot,
     };
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
+
+    const TEST_PLUGIN_ID: &str = "test.control.facade";
+
+    struct TestControlPlugin {
+        manifest: PluginManifest,
+    }
+
+    impl mutsuki_service_plugin_loader::HostPlugin for TestControlPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn call(
+            &self,
+            operation: &str,
+            payload: Value,
+        ) -> mutsuki_service_plugin_loader::HostPluginCallResult<Value> {
+            match operation {
+                "echo" => Ok(payload),
+                other => Err(HostPluginCallError::UnsupportedOperation(other.into())),
+            }
+        }
+    }
+
+    fn test_control_plugin() -> Arc<dyn mutsuki_service_plugin_loader::HostPlugin> {
+        Arc::new(TestControlPlugin {
+            manifest: minimal_manifest(TEST_PLUGIN_ID),
+        })
+    }
+
+    fn test_builtin_registry() -> BuiltinRegistry {
+        let mut registry = BuiltinRegistry::new();
+        registry.register(test_control_plugin());
+        registry
+    }
 
     #[test]
     fn log_tail_reads_recent_lines_and_advances_cursor() {
@@ -1329,17 +1357,14 @@ mod tests {
                 token: "token".into(),
                 method: ControlMethod::PluginCall,
                 params: json!(PluginCallParams {
-                    plugin_id: mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into(),
-                    operation: "send".into(),
+                    plugin_id: TEST_PLUGIN_ID.into(),
+                    operation: "echo".into(),
                     payload: json!({ "message": "hello" }),
                 }),
             })
             .await;
         assert!(success.ok);
-        let response: ConversationSendResponse =
-            serde_json::from_value(success.result.expect("result")).expect("send response");
-        assert_eq!(response.turns.len(), 2);
-        assert_eq!(response.reply.role, "assistant");
+        assert_eq!(success.result, Some(json!({ "message": "hello" })));
     }
 
     #[tokio::test]
@@ -1365,7 +1390,7 @@ mod tests {
                 token: "token".into(),
                 method: ControlMethod::PluginCall,
                 params: json!(PluginCallParams {
-                    plugin_id: mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into(),
+                    plugin_id: TEST_PLUGIN_ID.into(),
                     operation: "missing".into(),
                     payload: Value::Null,
                 }),
@@ -1621,10 +1646,7 @@ mod tests {
         let plugins: Vec<PluginStatus> =
             serde_json::from_value(plugins.result.expect("plugins")).expect("plugin list");
         assert_eq!(plugins.len(), 1);
-        assert_eq!(
-            plugins[0].plugin_id,
-            mutsuki_service_plugin_conversation_sim::PLUGIN_ID
-        );
+        assert_eq!(plugins[0].plugin_id, TEST_PLUGIN_ID);
     }
 
     #[tokio::test]
@@ -2079,10 +2101,9 @@ mod tests {
     fn test_runtime_inner(token: &str) -> ServiceRuntimeInner {
         let mut config = ServiceConfig::default();
         config.ipc.token = Some(token.into());
-        let mut registry = BuiltinRegistry::new();
-        registry.register(mutsuki_service_plugin_conversation_sim::plugin());
+        let registry = test_builtin_registry();
         let selection = registry
-            .load_requested(&[mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into()])
+            .load_requested(&[TEST_PLUGIN_ID.into()])
             .expect("builtin available");
         let catalog = PluginCatalog::scan(&[], Path::new("missing-disabled"), selection)
             .expect("catalog scan");
@@ -2106,10 +2127,10 @@ mod tests {
         config.service.home_dir = root.to_path_buf();
         config.service.log_dir = root.join("logs");
         config.service.run_dir = root.join("run");
-        config.plugins.builtin = vec![mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into()];
+        config.plugins.builtin = vec![TEST_PLUGIN_ID.into()];
         config.plugins.dynamic_dirs = vec![root.join("installed")];
         config.plugins.disabled_dir = root.join("disabled");
-        let registry = builtin_registry();
+        let registry = test_builtin_registry();
         let catalog = load_catalog(&config, &registry).expect("catalog");
         let host_runtime = boot_core(&config, &catalog, &[]).expect("core");
         ServiceRuntimeInner {

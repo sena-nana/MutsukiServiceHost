@@ -24,13 +24,8 @@ runner_link = "jsonl-stdio"
 `mutsuki-runtime-host::JsonlRunner` (`runner.run_batch`). Other external processes can still be
 supervised as sidecars, but they are not advertised to Core as executable runners.
 
-Builtin host facades are linked at compile time and enabled through `[plugins].builtin`.
-The default ServiceHost build links:
-
-- `mutsuki.conversation.sim` — **dev/mock** conversation control facade (not long-term business state)
-- `mutsuki.terminal.tui` — **UI host feature** for the local terminal client (not a runtime effect plugin)
-
-If a requested builtin was not linked into the binary, startup fails with `BuiltinUnavailable`.
+The default ServiceHost build links no builtin plugins. Product binaries may link real plugin crates
+and enable them through `[plugins].builtin`; unavailable names fail startup with `BuiltinUnavailable`.
 
 Product binaries can add native plugins without editing ServiceHost's internal registry by using `ServiceRuntimeBuilder::register_builtin_plugin`. Their native runners must be supplied through `register_builtin_runner` as recreatable factories; the same factories are used for initial boot and generation reload. Product registrations are frozen before Core resolves the runtime profile/load plan.
 
