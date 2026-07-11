@@ -37,10 +37,20 @@ The service host does not own task scheduling. Core remains the source of truth 
 
 `ServiceRuntimeBuilder` is the only product-side registration window. Product manifests are added to the builtin catalog before `RuntimeProfile` and the Core load plan are resolved. Native runners are registered as factories so reload can construct a fresh generation; runtime registration remains disabled.
 
+Factories that initialize fallible external clients use
+`register_fallible_builtin_runner`. Their errors fail initial Core boot or the
+prepared reload with a structured Host error instead of panicking inside a
+plugin factory.
+
 Runtime-client-aware runner factories use the same frozen registration window.
 The Host binds their generic SDK client only after Core boot and recreates the
 runner on reload; this is not a dynamic registration path or a domain-specific
 service API.
+
+Product bundles may register read-only `health` component probes during the
+same frozen assembly window. Probe snapshots appear under
+`HealthReport.components`; they must not mutate runtime state or expose
+secrets.
 
 `HostEventSource` represents a long-lived external connection. Its context exposes only a Core `TaskSubmitter`, a shutdown token, read-only non-secret service configuration, environment-backed secret lookup, structured logging, and the source instance id. It cannot access `TaskPool`, `StateStore`, or `EventLog`. The host isolates source errors and panics, tracks lifecycle/health, supports explicit restart, and bounds shutdown by the configured graceful timeout.
 

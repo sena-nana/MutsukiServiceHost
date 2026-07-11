@@ -223,6 +223,8 @@ pub struct HealthReport {
     pub event_sources: String,
     pub event_source_details: Vec<EventSourceStatus>,
     pub recent_errors: Vec<String>,
+    #[serde(default)]
+    pub components: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

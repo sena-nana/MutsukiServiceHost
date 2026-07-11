@@ -47,7 +47,8 @@ pub use event_source::{
     HostShutdownToken,
 };
 
-type NativeRunnerFactory = Arc<dyn Fn() -> Box<dyn Runner> + Send + Sync>;
+type NativeRunnerFactory = Arc<dyn Fn() -> Result<Box<dyn Runner>, String> + Send + Sync>;
+type HealthProbe = Arc<dyn Fn() -> Value + Send + Sync>;
 
 #[derive(Default)]
 struct DeferredRuntimeClient(OnceLock<RuntimeClientRef>);
@@ -103,6 +104,8 @@ pub enum ServiceRuntimeError {
     AlreadyStarted,
     #[error("event source registration failed: {0}")]
     EventSource(String),
+    #[error("native runner factory failed: {0}")]
+    NativeRunnerFactory(String),
 }
 
 pub type ServiceRuntimeResult<T> = Result<T, ServiceRuntimeError>;
@@ -122,6 +125,7 @@ pub struct ServiceRuntimeBuilder {
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
+    health_probes: BTreeMap<String, HealthProbe>,
     event_sources: Vec<Box<dyn HostEventSource>>,
 }
 
@@ -134,6 +138,7 @@ struct ServiceRuntimeInner {
     event_sources: EventSourceSupervisor,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    health_probes: BTreeMap<String, HealthProbe>,
     shutdown_tx: Mutex<Option<oneshot::Sender<String>>>,
 }
 
@@ -163,6 +168,7 @@ impl ServiceRuntimeBuilder {
             builtin_registry: builtin_registry(),
             native_runner_factories: Vec::new(),
             runtime_client: Arc::new(DeferredRuntimeClient::default()),
+            health_probes: BTreeMap::new(),
             event_sources: Vec::new(),
         }
     }
@@ -184,7 +190,21 @@ impl ServiceRuntimeBuilder {
     where
         F: Fn() -> Box<dyn Runner> + Send + Sync + 'static,
     {
-        self.native_runner_factories.push(Arc::new(factory));
+        self.native_runner_factories
+            .push(Arc::new(move || Ok(factory())));
+        self
+    }
+
+    /// Registers a recreatable native runner whose external client or other
+    /// fallible dependency is initialized at boot and every Core reload.
+    pub fn register_fallible_builtin_runner<F, E>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Result<Box<dyn Runner>, E> + Send + Sync + 'static,
+        E: std::fmt::Display,
+    {
+        self.native_runner_factories.push(Arc::new(move || {
+            factory().map_err(|error| error.to_string())
+        }));
         self
     }
 
@@ -195,7 +215,17 @@ impl ServiceRuntimeBuilder {
     {
         let client = self.runtime_client.clone();
         self.native_runner_factories
-            .push(Arc::new(move || factory(client.clone())));
+            .push(Arc::new(move || Ok(factory(client.clone()))));
+        self
+    }
+
+    /// Registers a domain-neutral product component snapshot for `health`.
+    pub fn register_health_probe<F>(mut self, component_id: impl Into<String>, probe: F) -> Self
+    where
+        F: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.health_probes
+            .insert(component_id.into(), Arc::new(probe));
         self
     }
 
@@ -210,6 +240,7 @@ impl ServiceRuntimeBuilder {
             builtin_registry,
             native_runner_factories,
             runtime_client,
+            health_probes,
             event_sources,
         } = self;
         validate_event_sources(&event_sources, &config)?;
@@ -234,6 +265,7 @@ impl ServiceRuntimeBuilder {
             event_sources: event_source_supervisor.clone(),
             builtin_registry,
             native_runner_factories,
+            health_probes,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
         let core_pump = spawn_core_pump(Arc::downgrade(&inner), core_pump_rx);
@@ -698,6 +730,11 @@ impl ServiceRuntimeInner {
                     .map(|error| format!("event_source:{}:{error}", source.source_id))
             })
             .collect();
+        let components = self
+            .health_probes
+            .iter()
+            .map(|(id, probe)| (id.clone(), probe()))
+            .collect();
         let report = HealthReport {
             service: "ok".into(),
             core: if self
@@ -715,6 +752,7 @@ impl ServiceRuntimeInner {
             event_sources: event_source_health.into(),
             event_source_details,
             recent_errors,
+            components,
         };
         ControlResponse::ok(report)
     }
@@ -847,7 +885,8 @@ fn runtime_bootstrapper(
     }
 
     for factory in native_runner_factories {
-        bootstrapper.register_builtin_runner(factory());
+        bootstrapper
+            .register_builtin_runner(factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?);
     }
     Ok((
         bootstrapper,
@@ -1706,6 +1745,57 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn fallible_native_runner_factory_fails_without_panicking() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.observe.console = false;
+        config.service.log_dir = dir.path().join("logs");
+        config.plugins.builtin.clear();
+        config.plugins.dynamic_dirs.clear();
+
+        let result = ServiceRuntimeBuilder::new(config)
+            .register_fallible_builtin_runner(|| -> Result<Box<dyn Runner>, &'static str> {
+                Err("client init rejected")
+            })
+            .start()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceRuntimeError::NativeRunnerFactory(message))
+                if message == "client init rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_health_probe_is_exposed_without_domain_coupling() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.observe.console = false;
+        config.service.log_dir = dir.path().join("logs");
+        config.plugins.builtin.clear();
+        config.plugins.dynamic_dirs.clear();
+
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .register_health_probe(
+                "test.component",
+                || serde_json::json!({"status": "ok", "ready": true}),
+            )
+            .start()
+            .await
+            .expect("runtime starts");
+        let response = runtime.inner.health_check().await;
+        let report: HealthReport = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(report.components["test.component"]["status"], "ok");
+        assert_eq!(report.components["test.component"]["ready"], true);
+        runtime.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn product_builder_event_source_runs_real_three_stage_pipeline() {
         let dir = tempdir().expect("temp dir");
@@ -2117,6 +2207,7 @@ mod tests {
             event_sources: EventSourceSupervisor::default(),
             builtin_registry: registry,
             native_runner_factories: Vec::new(),
+            health_probes: BTreeMap::new(),
             shutdown_tx: Mutex::new(None),
         }
     }
@@ -2142,6 +2233,7 @@ mod tests {
             event_sources: EventSourceSupervisor::default(),
             builtin_registry: registry,
             native_runner_factories: Vec::new(),
+            health_probes: BTreeMap::new(),
             shutdown_tx: Mutex::new(None),
         }
     }
