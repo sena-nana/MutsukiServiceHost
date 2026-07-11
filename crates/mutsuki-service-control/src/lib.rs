@@ -31,6 +31,8 @@ pub enum ControlMethod {
     RunnerList,
     RunnerRestart,
     RunnerStop,
+    EventSourceList,
+    EventSourceRestart,
     TaskList,
     TaskCancel,
     TaskOutcome,
@@ -138,6 +140,8 @@ pub struct PluginReloadResponse {
     pub plugin_count: usize,
     pub changes: Vec<PluginReloadChange>,
     pub runner_errors: Vec<String>,
+    /// Event sources are product-scoped and remain running across plugin generation reloads.
+    pub event_sources: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +158,18 @@ pub struct RunnerStatus {
     pub pid: Option<u32>,
     pub restarts: u32,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventSourceStatus {
+    pub source_id: String,
+    pub plugin_id: String,
+    pub instance_id: String,
+    pub state: String,
+    pub health: String,
+    pub last_error: Option<String>,
+    pub reconnects: u32,
+    pub last_event_unix_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +220,8 @@ pub struct HealthReport {
     pub core: String,
     pub plugins: String,
     pub runners: String,
+    pub event_sources: String,
+    pub event_source_details: Vec<EventSourceStatus>,
     pub recent_errors: Vec<String>,
 }
 

@@ -32,9 +32,12 @@ The default ServiceHost build links:
 
 If a requested builtin was not linked into the binary, startup fails with `BuiltinUnavailable`.
 
+Product binaries can add native plugins without editing ServiceHost's internal registry by using `ServiceRuntimeBuilder::register_builtin_plugin`. Their native runners must be supplied through `register_builtin_runner` as recreatable factories; the same factories are used for initial boot and generation reload. Product registrations are frozen before Core resolves the runtime profile/load plan.
+
 `HostPlugin` remains a control-plane facade and must not become a parallel business runtime path.
 
 `plugin_reload` uses the same loader path as startup. The host rescans and validates manifests,
 prepares a new Core load-plan generation, drains active runtime work, swaps Core through
 `mutsuki-runtime-host`, then replaces the active catalog. External sidecars that are not Core
 stdio runners are reconciled after the swap.
+Product event sources are kept across plugin reload; they can be restarted explicitly through the event-source control API.

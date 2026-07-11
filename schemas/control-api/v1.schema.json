@@ -17,6 +17,8 @@
         "runner_list",
         "runner_restart",
         "runner_stop",
+        "event_source_list",
+        "event_source_restart",
         "task_list",
         "task_cancel",
         "task_outcome",
@@ -117,7 +119,8 @@
         "registry_generation",
         "plugin_count",
         "changes",
-        "runner_errors"
+        "runner_errors",
+        "event_sources"
       ],
       "properties": {
         "previous_generation": { "type": "integer", "minimum": 0 },
@@ -140,7 +143,31 @@
         "runner_errors": {
           "type": "array",
           "items": { "type": "string" }
-        }
+        },
+        "event_sources": { "const": "kept" }
+      }
+    },
+    "eventSourceStatus": {
+      "type": "object",
+      "required": [
+        "source_id", "plugin_id", "instance_id", "state", "health",
+        "last_error", "reconnects", "last_event_unix_ms"
+      ],
+      "properties": {
+        "source_id": { "type": "string" },
+        "plugin_id": { "type": "string" },
+        "instance_id": { "type": "string" },
+        "state": {
+          "type": "string",
+          "enum": ["starting", "running", "failed", "restarting", "stopping", "stopped"]
+        },
+        "health": {
+          "type": "string",
+          "enum": ["unknown", "healthy", "degraded", "unhealthy"]
+        },
+        "last_error": { "type": ["string", "null"] },
+        "reconnects": { "type": "integer", "minimum": 0 },
+        "last_event_unix_ms": { "type": ["integer", "null"], "minimum": 0 }
       }
     }
   }

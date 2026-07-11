@@ -22,7 +22,7 @@ pub enum PluginLoaderError {
     #[error("failed to parse plugin manifest {path}: {source}")]
     ParseManifest {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("plugin {plugin_id} uses unsupported api version {api_version}")]
     UnsupportedApiVersion {
@@ -83,6 +83,7 @@ pub struct PluginCatalog {
 
 #[derive(Clone, Default)]
 pub struct BuiltinRegistry {
+    manifests: BTreeMap<String, PluginManifest>,
     plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
 
@@ -117,25 +118,36 @@ impl BuiltinRegistry {
     }
 
     pub fn register(&mut self, plugin: Arc<dyn HostPlugin>) {
+        self.manifests.insert(
+            plugin.manifest().plugin_id.clone(),
+            plugin.manifest().clone(),
+        );
         self.plugins
             .insert(plugin.manifest().plugin_id.clone(), plugin);
+    }
+
+    /// Registers a product-linked builtin that has no control-plane `HostPlugin` facade.
+    pub fn register_manifest(&mut self, manifest: PluginManifest) {
+        self.manifests.insert(manifest.plugin_id.clone(), manifest);
     }
 
     pub fn load_requested(&self, requested: &[String]) -> PluginLoaderResult<BuiltinSelection> {
         let mut records = Vec::new();
         let mut host_plugins = BTreeMap::new();
         for plugin_id in requested {
-            let Some(plugin) = self.plugins.get(plugin_id) else {
+            let Some(manifest) = self.manifests.get(plugin_id) else {
                 return Err(PluginLoaderError::BuiltinUnavailable(plugin_id.clone()));
             };
-            let manifest = plugin.manifest();
+            validate_manifest(manifest, None)?;
             records.push(PluginRecord {
                 manifest_path: PathBuf::from("<builtin>"),
                 manifest: manifest.clone(),
                 runtime: None,
                 enabled: true,
             });
-            host_plugins.insert(plugin_id.clone(), plugin.clone());
+            if let Some(plugin) = self.plugins.get(plugin_id) {
+                host_plugins.insert(plugin_id.clone(), plugin.clone());
+            }
         }
         Ok(BuiltinSelection {
             records,
@@ -212,7 +224,7 @@ fn read_plugin_manifest(path: &Path) -> PluginLoaderResult<PluginToml> {
     })?;
     toml::from_str(&content).map_err(|source| PluginLoaderError::ParseManifest {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 

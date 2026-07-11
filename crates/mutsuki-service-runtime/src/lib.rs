@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 #[cfg(test)]
 use std::io::Write;
@@ -34,7 +34,18 @@ use mutsuki_service_runner_supervisor::{
     ManagedRunnerSpec, RunnerProcessState, RunnerSnapshot, RunnerSupervisor,
 };
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+
+mod event_source;
+
+use event_source::EventSourceSupervisor;
+pub use event_source::{
+    HostEventSource, HostEventSourceConfig, HostEventSourceContext, HostEventSourceDescriptor,
+    HostEventSourceError, HostEventSourceFuture, HostEventSourceHealth, HostEventSourceLogger,
+    HostShutdownToken,
+};
+
+type NativeRunnerFactory = Arc<dyn Fn() -> Box<dyn Runner> + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceRuntimeError {
@@ -53,6 +64,8 @@ pub enum ServiceRuntimeError {
     },
     #[error("service runtime already started")]
     AlreadyStarted,
+    #[error("event source registration failed: {0}")]
+    EventSource(String),
 }
 
 pub type ServiceRuntimeResult<T> = Result<T, ServiceRuntimeError>;
@@ -61,7 +74,17 @@ pub struct ServiceRuntime {
     inner: Arc<ServiceRuntimeInner>,
     shutdown_rx: Option<oneshot::Receiver<String>>,
     ipc_server: Option<IpcServer>,
+    core_pump_shutdown: watch::Sender<bool>,
+    core_pump: Option<tokio::task::JoinHandle<()>>,
     _observe: mutsuki_service_observe::ObserveGuard,
+}
+
+/// Product assembly boundary. All manifests, native runners and event sources are frozen at boot.
+pub struct ServiceRuntimeBuilder {
+    config: ServiceConfig,
+    builtin_registry: BuiltinRegistry,
+    native_runner_factories: Vec<NativeRunnerFactory>,
+    event_sources: Vec<Box<dyn HostEventSource>>,
 }
 
 struct ServiceRuntimeInner {
@@ -70,26 +93,97 @@ struct ServiceRuntimeInner {
     catalog: Mutex<PluginCatalog>,
     host_runtime: Mutex<Option<HostRuntime>>,
     supervisor: RunnerSupervisor,
+    event_sources: EventSourceSupervisor,
+    builtin_registry: BuiltinRegistry,
+    native_runner_factories: Vec<NativeRunnerFactory>,
     shutdown_tx: Mutex<Option<oneshot::Sender<String>>>,
 }
 
 impl ServiceRuntime {
     pub async fn start(config: ServiceConfig) -> ServiceRuntimeResult<Self> {
+        ServiceRuntimeBuilder::new(config).start().await
+    }
+}
+
+impl Drop for ServiceRuntime {
+    fn drop(&mut self) {
+        if let Some(server) = self.ipc_server.take() {
+            server.abort();
+        }
+        let _ = self.core_pump_shutdown.send(true);
+        self.inner.event_sources.abort();
+        if let Some(task) = self.core_pump.take() {
+            task.abort();
+        }
+    }
+}
+
+impl ServiceRuntimeBuilder {
+    pub fn new(config: ServiceConfig) -> Self {
+        Self {
+            config,
+            builtin_registry: builtin_registry(),
+            native_runner_factories: Vec::new(),
+            event_sources: Vec::new(),
+        }
+    }
+
+    /// Registers and enables a product-provided builtin manifest before the load plan is built.
+    pub fn register_builtin_plugin(
+        mut self,
+        manifest: mutsuki_runtime_contracts::PluginManifest,
+    ) -> Self {
+        if !self.config.plugins.builtin.contains(&manifest.plugin_id) {
+            self.config.plugins.builtin.push(manifest.plugin_id.clone());
+        }
+        self.builtin_registry.register_manifest(manifest);
+        self
+    }
+
+    /// Registers a recreatable native runner factory for initial boot and every Core reload.
+    pub fn register_builtin_runner<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn Runner> + Send + Sync + 'static,
+    {
+        self.native_runner_factories.push(Arc::new(factory));
+        self
+    }
+
+    pub fn register_event_source(mut self, source: Box<dyn HostEventSource>) -> Self {
+        self.event_sources.push(source);
+        self
+    }
+
+    pub async fn start(self) -> ServiceRuntimeResult<ServiceRuntime> {
+        let ServiceRuntimeBuilder {
+            config,
+            builtin_registry,
+            native_runner_factories,
+            event_sources,
+        } = self;
+        validate_event_sources(&event_sources)?;
         let observe = mutsuki_service_observe::init_observe(&config);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (core_pump_shutdown, core_pump_rx) = watch::channel(false);
         let supervisor = RunnerSupervisor::new();
-        let catalog = load_catalog(&config)?;
-        let host_runtime = boot_core(&config, &catalog)?;
+        let event_source_supervisor = EventSourceSupervisor::default();
+        let catalog = load_catalog(&config, &builtin_registry)?;
+        let host_runtime = boot_core(&config, &catalog, &native_runner_factories)?;
+        let task_submitter = host_runtime.host_context().task_submitter_ref();
         start_supervised_sidecars(&config, &catalog, &supervisor).await;
 
         let inner = Arc::new(ServiceRuntimeInner {
-            config,
+            config: config.clone(),
             started_at: Instant::now(),
             catalog: Mutex::new(catalog),
             host_runtime: Mutex::new(Some(host_runtime)),
             supervisor,
+            event_sources: event_source_supervisor.clone(),
+            builtin_registry,
+            native_runner_factories,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
+        let core_pump = spawn_core_pump(Arc::downgrade(&inner), core_pump_rx);
         let ipc_server = mutsuki_service_ipc::start_server(
             &inner.config,
             Arc::new(RuntimeControl {
@@ -97,14 +191,44 @@ impl ServiceRuntime {
             }),
         )
         .await?;
-        Ok(Self {
+        let graceful = Duration::from_millis(config.runners.graceful_shutdown_ms);
+        for source in event_sources {
+            event_source_supervisor.start(source, task_submitter.clone(), &config, graceful);
+        }
+        Ok(ServiceRuntime {
             inner,
             shutdown_rx: Some(shutdown_rx),
             ipc_server,
+            core_pump_shutdown,
+            core_pump: Some(core_pump),
             _observe: observe,
         })
     }
+}
 
+fn validate_event_sources(sources: &[Box<dyn HostEventSource>]) -> ServiceRuntimeResult<()> {
+    let mut ids = BTreeSet::new();
+    for source in sources {
+        let descriptor = source.descriptor();
+        if descriptor.source_id.trim().is_empty()
+            || descriptor.plugin_id.trim().is_empty()
+            || descriptor.instance_id.trim().is_empty()
+        {
+            return Err(ServiceRuntimeError::EventSource(
+                "source id, plugin id and instance id must not be empty".into(),
+            ));
+        }
+        if !ids.insert(descriptor.source_id.clone()) {
+            return Err(ServiceRuntimeError::EventSource(format!(
+                "duplicate event source id {}",
+                descriptor.source_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl ServiceRuntime {
     pub async fn run_foreground(self) -> ServiceRuntimeResult<()> {
         let ctrl_c = async {
             match tokio::signal::ctrl_c().await {
@@ -147,6 +271,11 @@ impl ServiceRuntime {
             server.abort();
         }
         let graceful = Duration::from_millis(self.inner.config.runners.graceful_shutdown_ms);
+        self.inner.event_sources.shutdown(graceful).await;
+        let _ = self.core_pump_shutdown.send(true);
+        if let Some(core_pump) = self.core_pump.take() {
+            let _ = core_pump.await;
+        }
         self.inner.supervisor.shutdown(graceful).await;
         let _ = self
             .inner
@@ -155,6 +284,32 @@ impl ServiceRuntime {
             .expect("host runtime mutex")
             .take();
     }
+}
+
+fn spawn_core_pump(
+    inner: std::sync::Weak<ServiceRuntimeInner>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = interval.tick() => {
+                    let Some(inner) = inner.upgrade() else { break; };
+                    let result = inner
+                        .host_runtime
+                        .lock()
+                        .expect("host runtime mutex")
+                        .as_ref()
+                        .map(|runtime| runtime.dispatch(HostRuntimeCommand::TickOnce));
+                    if let Some(Err(error)) = result {
+                        tracing::error!(error = %error, "core service tick failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 struct RuntimeControl {
@@ -183,6 +338,8 @@ impl ServiceRuntimeInner {
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
+            ControlMethod::EventSourceList => self.event_source_list(),
+            ControlMethod::EventSourceRestart => self.event_source_restart(request.params).await,
             ControlMethod::TaskList => self.task_list(),
             ControlMethod::TaskCancel => self.task_cancel(request.params),
             ControlMethod::TaskOutcome => self.task_outcome(request.params),
@@ -257,7 +414,7 @@ impl ServiceRuntimeInner {
     }
 
     async fn plugin_reload(&self) -> ControlResponse {
-        let new_catalog = match load_catalog(&self.config) {
+        let new_catalog = match load_catalog(&self.config, &self.builtin_registry) {
             Ok(catalog) => catalog,
             Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
         };
@@ -270,11 +427,10 @@ impl ServiceRuntimeInner {
         };
         let registry_generation = previous_generation.saturating_add(1);
         let prepared =
-            match runtime_bootstrapper(&self.config, &new_catalog).and_then(
-                |(bootstrapper, profile)| {
+            match runtime_bootstrapper(&self.config, &new_catalog, &self.native_runner_factories)
+                .and_then(|(bootstrapper, profile)| {
                     Ok(bootstrapper.prepare_reload(profile, registry_generation)?)
-                },
-            ) {
+                }) {
                 Ok(reload) => reload,
                 Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
             };
@@ -312,6 +468,7 @@ impl ServiceRuntimeInner {
                 })
                 .collect(),
             runner_errors,
+            event_sources: "kept".into(),
         })
     }
 
@@ -372,6 +529,21 @@ impl ServiceRuntimeInner {
         }
     }
 
+    fn event_source_list(&self) -> ControlResponse {
+        ControlResponse::ok(self.event_sources.list())
+    }
+
+    async fn event_source_restart(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<IdParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        match self.event_sources.restart(&param.id).await {
+            Ok(()) => ControlResponse::empty_ok(),
+            Err(error) => ControlResponse::err(ControlError::Failed(error)),
+        }
+    }
+
     fn task_list(&self) -> ControlResponse {
         let mut guard = self.host_runtime.lock().expect("host runtime mutex");
         let Some(runtime) = guard.as_mut() else {
@@ -428,6 +600,7 @@ impl ServiceRuntimeInner {
 
     async fn health_check(&self) -> ControlResponse {
         let runners = self.supervisor.list().await;
+        let event_source_details = self.event_sources.list();
         let runner_health = if runners
             .iter()
             .any(|runner| matches!(runner.state, RunnerProcessState::Failed))
@@ -436,6 +609,23 @@ impl ServiceRuntimeInner {
         } else {
             "ok"
         };
+        let event_source_health = if event_source_details
+            .iter()
+            .any(|source| source.state == "failed" || source.health == "unhealthy")
+        {
+            "degraded"
+        } else {
+            "ok"
+        };
+        let recent_errors = event_source_details
+            .iter()
+            .filter_map(|source| {
+                source
+                    .last_error
+                    .as_ref()
+                    .map(|error| format!("event_source:{}:{error}", source.source_id))
+            })
+            .collect();
         let report = HealthReport {
             service: "ok".into(),
             core: if self
@@ -450,7 +640,9 @@ impl ServiceRuntimeInner {
             },
             plugins: "ok".into(),
             runners: runner_health.into(),
-            recent_errors: Vec::new(),
+            event_sources: event_source_health.into(),
+            event_source_details,
+            recent_errors,
         };
         ControlResponse::ok(report)
     }
@@ -473,8 +665,11 @@ impl ServiceRuntimeInner {
     }
 }
 
-fn load_catalog(config: &ServiceConfig) -> ServiceRuntimeResult<PluginCatalog> {
-    let builtin = builtin_registry().load_requested(&config.plugins.builtin)?;
+fn load_catalog(
+    config: &ServiceConfig,
+    builtin_registry: &BuiltinRegistry,
+) -> ServiceRuntimeResult<PluginCatalog> {
+    let builtin = builtin_registry.load_requested(&config.plugins.builtin)?;
     Ok(PluginCatalog::scan(
         &config.plugins.dynamic_dirs,
         &config.plugins.disabled_dir,
@@ -542,17 +737,24 @@ fn read_log_tail(
     Ok(LogTailResponse { cursor, entries })
 }
 
-fn boot_core(config: &ServiceConfig, catalog: &PluginCatalog) -> ServiceRuntimeResult<HostRuntime> {
-    let (bootstrapper, profile) = runtime_bootstrapper(config, catalog)?;
-    let mut host_config = HostRuntimeConfig::default();
-    host_config.worker_threads = config.core.worker_threads;
-    host_config.blocking_threads = config.core.blocking_threads;
+fn boot_core(
+    config: &ServiceConfig,
+    catalog: &PluginCatalog,
+    native_runner_factories: &[NativeRunnerFactory],
+) -> ServiceRuntimeResult<HostRuntime> {
+    let (bootstrapper, profile) = runtime_bootstrapper(config, catalog, native_runner_factories)?;
+    let host_config = HostRuntimeConfig {
+        worker_threads: config.core.worker_threads,
+        blocking_threads: config.core.blocking_threads,
+        ..HostRuntimeConfig::default()
+    };
     Ok(bootstrapper.into_host_runtime_with_config(profile, host_config)?)
 }
 
 fn runtime_bootstrapper(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
+    native_runner_factories: &[NativeRunnerFactory],
 ) -> ServiceRuntimeResult<(RuntimeBootstrapper, RuntimeProfile)> {
     let mut bootstrapper = RuntimeBootstrapper::new();
     let mut enabled_plugins = Vec::new();
@@ -575,6 +777,10 @@ fn runtime_bootstrapper(
         if let Some(runtime) = &record.runtime {
             register_stdio_runners(config, &mut bootstrapper, record, runtime, deployment)?;
         }
+    }
+
+    for factory in native_runner_factories {
+        bootstrapper.register_builtin_runner(factory());
     }
 
     Ok((
@@ -932,11 +1138,15 @@ fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mutsuki_runtime_contracts::{
-        ArtifactType, LifecyclePolicy, PermissionGrant, PluginArtifact, PluginManifest,
-        PluginProvides, Task,
+        ArtifactType, CompletionBatch, ExecutionClass, LifecyclePolicy, PermissionGrant,
+        PluginArtifact, PluginManifest, PluginProvides, RunnerBatchCapability,
+        RunnerControlCapability, RunnerOrderingCapability, RunnerPayloadCapability, RunnerPurity,
+        RunnerResourceCapability, Task, WorkBatch,
     };
+    use mutsuki_runtime_sdk::map_work_batch_entries;
     use mutsuki_service_control::{
         ConversationSendResponse, PluginCallParams, PluginReloadResponse, TaskOutcomeView,
         TaskSnapshot,
@@ -1384,6 +1594,337 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_builder_event_source_runs_real_three_stage_echo_chain() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        std::fs::create_dir_all(dir.path().join("run")).expect("run");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.ipc.token = Some("test-token".into());
+        config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
+        config.plugins.builtin.clear();
+        config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
+        config.runners.graceful_shutdown_ms = 250;
+
+        let echo_count = Arc::new(AtomicUsize::new(0));
+        let source_starts = Arc::new(AtomicUsize::new(0));
+        let source_stops = Arc::new(AtomicUsize::new(0));
+        let source = MockGatewaySource {
+            descriptor: HostEventSourceDescriptor::new("mock-gateway", "test.gateway"),
+            starts: source_starts.clone(),
+            stops: source_stops.clone(),
+        };
+        let router_descriptor =
+            chain_descriptor("test.router", "test.router.runner", "bot.gateway");
+        let command_descriptor =
+            chain_descriptor("test.command", "test.command.runner", "bot.command.parse");
+        let echo_descriptor = chain_descriptor("test.echo", "test.echo.runner", "bot.command.echo");
+
+        let router_factory_descriptor = router_descriptor.clone();
+        let command_factory_descriptor = command_descriptor.clone();
+        let echo_factory_descriptor = echo_descriptor.clone();
+        let echo_factory_count = echo_count.clone();
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .register_builtin_plugin(runner_manifest("test.router", router_descriptor))
+            .register_builtin_plugin(runner_manifest("test.command", command_descriptor))
+            .register_builtin_plugin(runner_manifest("test.echo", echo_descriptor))
+            .register_builtin_runner(move || {
+                Box::new(ChainRunner::next(
+                    router_factory_descriptor.clone(),
+                    "bot.command.parse",
+                ))
+            })
+            .register_builtin_runner(move || {
+                Box::new(ChainRunner::next(
+                    command_factory_descriptor.clone(),
+                    "bot.command.echo",
+                ))
+            })
+            .register_builtin_runner(move || {
+                Box::new(ChainRunner::terminal(
+                    echo_factory_descriptor.clone(),
+                    echo_factory_count.clone(),
+                ))
+            })
+            .register_event_source(Box::new(source))
+            .start()
+            .await
+            .expect("real service runtime starts");
+
+        wait_for_count(&echo_count, 1).await;
+        let snapshots = runtime
+            .inner
+            .host_runtime
+            .lock()
+            .expect("runtime mutex")
+            .as_ref()
+            .expect("runtime")
+            .task_snapshots()
+            .expect("task snapshots");
+        assert_eq!(snapshots.len(), 3);
+        assert!(
+            snapshots
+                .iter()
+                .all(|task| task.status == TaskStatus::Completed)
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|task| task.correlation_id.as_deref() == Some("corr-mock-1"))
+        );
+
+        let unauthorized_sources = runtime
+            .inner
+            .handle_request(ControlRequest {
+                token: "wrong".into(),
+                method: ControlMethod::EventSourceList,
+                params: Value::Null,
+            })
+            .await;
+        assert_eq!(
+            unauthorized_sources.error.expect("unauthorized").code,
+            "unauthorized"
+        );
+        let sources = runtime
+            .inner
+            .handle_request(ControlRequest {
+                token: "test-token".into(),
+                method: ControlMethod::EventSourceList,
+                params: Value::Null,
+            })
+            .await;
+        let sources: Vec<mutsuki_service_control::EventSourceStatus> =
+            serde_json::from_value(sources.result.expect("sources")).expect("source statuses");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].state, "running");
+        assert_eq!(sources[0].health, "healthy");
+        assert!(sources[0].last_event_unix_ms.is_some());
+
+        let health = runtime.inner.health_check().await;
+        let health: HealthReport =
+            serde_json::from_value(health.result.expect("health")).expect("health report");
+        assert_eq!(health.event_sources, "ok");
+        assert_eq!(health.event_source_details[0].source_id, "mock-gateway");
+
+        let reload = runtime.inner.plugin_reload().await;
+        assert!(reload.ok);
+        let reload: PluginReloadResponse =
+            serde_json::from_value(reload.result.expect("reload")).expect("reload response");
+        assert_eq!(reload.event_sources, "kept");
+        assert_eq!(source_starts.load(Ordering::SeqCst), 1);
+
+        let restart = runtime
+            .inner
+            .handle_request(ControlRequest {
+                token: "test-token".into(),
+                method: ControlMethod::EventSourceRestart,
+                params: json!({ "id": "mock-gateway" }),
+            })
+            .await;
+        assert!(restart.ok);
+        wait_for_count(&echo_count, 2).await;
+        let sources = runtime.inner.event_sources.list();
+        assert_eq!(sources[0].reconnects, 1);
+        assert_eq!(sources[0].state, "running");
+
+        runtime.shutdown().await;
+        assert_eq!(source_starts.load(Ordering::SeqCst), 2);
+        assert_eq!(source_stops.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn health_reports_event_source_runtime_failure_without_stopping_service() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.ipc.token = Some("test-token".into());
+        config.observe.console = false;
+        config.service.log_dir = dir.path().join("logs");
+        config.plugins.builtin.clear();
+        config.plugins.dynamic_dirs.clear();
+        config.runners.graceful_shutdown_ms = 50;
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .register_event_source(Box::new(FailingGatewaySource {
+                descriptor: HostEventSourceDescriptor::new("failed-gateway", "test.gateway"),
+            }))
+            .start()
+            .await
+            .expect("service stays available");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.event_sources.list()[0].state != "failed" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("source fails");
+
+        let health = runtime.inner.health_check().await;
+        let health: HealthReport =
+            serde_json::from_value(health.result.expect("health")).expect("health report");
+        assert_eq!(health.service, "ok");
+        assert_eq!(health.core, "ok");
+        assert_eq!(health.event_sources, "degraded");
+        assert!(health.recent_errors[0].contains("failed-gateway"));
+        runtime.shutdown().await;
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime completed chain");
+    }
+
+    struct MockGatewaySource {
+        descriptor: HostEventSourceDescriptor,
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    struct FailingGatewaySource {
+        descriptor: HostEventSourceDescriptor,
+    }
+
+    impl HostEventSource for FailingGatewaySource {
+        fn descriptor(&self) -> &HostEventSourceDescriptor {
+            &self.descriptor
+        }
+
+        fn start(&mut self, _ctx: HostEventSourceContext) -> HostEventSourceFuture {
+            Box::pin(async { Err(std::io::Error::other("gateway disconnected").into()) })
+        }
+
+        fn shutdown(&mut self) -> HostEventSourceFuture {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health(&self) -> HostEventSourceHealth {
+            HostEventSourceHealth::Unhealthy("gateway disconnected".into())
+        }
+    }
+
+    impl HostEventSource for MockGatewaySource {
+        fn descriptor(&self) -> &HostEventSourceDescriptor {
+            &self.descriptor
+        }
+
+        fn start(&mut self, ctx: HostEventSourceContext) -> HostEventSourceFuture {
+            let sequence = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                let mut task = Task::new(
+                    format!("mock-gateway-{sequence}"),
+                    "bot.gateway",
+                    json!({ "text": "/echo hello" }),
+                );
+                task.correlation_id = Some(format!("corr-mock-{sequence}"));
+                ctx.task_submitter.submit_task(task)?;
+                let mut shutdown = ctx.shutdown;
+                shutdown.cancelled().await;
+                Ok(())
+            })
+        }
+
+        fn shutdown(&mut self) -> HostEventSourceFuture {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health(&self) -> HostEventSourceHealth {
+            HostEventSourceHealth::Healthy
+        }
+    }
+
+    struct ChainRunner {
+        descriptor: RunnerDescriptor,
+        next_protocol: Option<&'static str>,
+        terminal_count: Option<Arc<AtomicUsize>>,
+    }
+
+    impl ChainRunner {
+        fn next(descriptor: RunnerDescriptor, next_protocol: &'static str) -> Self {
+            Self {
+                descriptor,
+                next_protocol: Some(next_protocol),
+                terminal_count: None,
+            }
+        }
+
+        fn terminal(descriptor: RunnerDescriptor, count: Arc<AtomicUsize>) -> Self {
+            Self {
+                descriptor,
+                next_protocol: None,
+                terminal_count: Some(count),
+            }
+        }
+    }
+
+    impl Runner for ChainRunner {
+        fn descriptor(&self) -> &RunnerDescriptor {
+            &self.descriptor
+        }
+
+        fn run_batch(
+            &mut self,
+            ctx: mutsuki_runtime_contracts::RunnerContext,
+            batch: WorkBatch,
+        ) -> RuntimeResult<CompletionBatch> {
+            let next_protocol = self.next_protocol;
+            let terminal_count = self.terminal_count.clone();
+            map_work_batch_entries(&batch, |task| {
+                let mut result = mutsuki_runtime_contracts::RunnerResult::completed(&task.task_id);
+                if let Some(protocol) = next_protocol {
+                    let mut next = Task::new(
+                        format!("{}:{protocol}", task.task_id),
+                        protocol,
+                        task.payload.clone(),
+                    );
+                    next.registry_generation = ctx.registry_generation;
+                    next.correlation_id = task.correlation_id.clone();
+                    result.tasks.push(next);
+                } else if let Some(count) = &terminal_count {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(result)
+            })
+        }
+    }
+
+    fn chain_descriptor(plugin_id: &str, runner_id: &str, protocol: &str) -> RunnerDescriptor {
+        RunnerDescriptor {
+            runner_id: runner_id.into(),
+            plugin_id: plugin_id.into(),
+            plugin_generation: 1,
+            accepted_protocol_ids: vec![protocol.into()],
+            purity: RunnerPurity::Pure,
+            execution_class: ExecutionClass::Orchestration,
+            input_schema: json!({}),
+            output_schema: json!({}),
+            batch: RunnerBatchCapability::default(),
+            payload: RunnerPayloadCapability::default(),
+            resources: RunnerResourceCapability::default(),
+            ordering: RunnerOrderingCapability::default(),
+            control: RunnerControlCapability::default(),
+            metadata: BTreeMap::new(),
+            contract_surfaces: vec![
+                format!("runner:{runner_id}"),
+                format!("task_protocol:{protocol}"),
+            ],
+        }
+    }
+
+    fn runner_manifest(plugin_id: &str, descriptor: RunnerDescriptor) -> PluginManifest {
+        mutsuki_runtime_host::runner_manifest(plugin_id, vec![descriptor])
+    }
+
     fn test_runtime_inner(token: &str) -> ServiceRuntimeInner {
         let mut config = ServiceConfig::default();
         config.ipc.token = Some(token.into());
@@ -1401,6 +1942,9 @@ mod tests {
             catalog: Mutex::new(catalog),
             host_runtime: Mutex::new(None),
             supervisor: RunnerSupervisor::new(),
+            event_sources: EventSourceSupervisor::default(),
+            builtin_registry: registry,
+            native_runner_factories: Vec::new(),
             shutdown_tx: Mutex::new(None),
         }
     }
@@ -1414,14 +1958,18 @@ mod tests {
         config.plugins.builtin = vec![mutsuki_service_plugin_conversation_sim::PLUGIN_ID.into()];
         config.plugins.dynamic_dirs = vec![root.join("installed")];
         config.plugins.disabled_dir = root.join("disabled");
-        let catalog = load_catalog(&config).expect("catalog");
-        let host_runtime = boot_core(&config, &catalog).expect("core");
+        let registry = builtin_registry();
+        let catalog = load_catalog(&config, &registry).expect("catalog");
+        let host_runtime = boot_core(&config, &catalog, &[]).expect("core");
         ServiceRuntimeInner {
             config,
             started_at: Instant::now(),
             catalog: Mutex::new(catalog),
             host_runtime: Mutex::new(Some(host_runtime)),
             supervisor: RunnerSupervisor::new(),
+            event_sources: EventSourceSupervisor::default(),
+            builtin_registry: registry,
+            native_runner_factories: Vec::new(),
             shutdown_tx: Mutex::new(None),
         }
     }

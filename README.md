@@ -12,6 +12,7 @@ It owns the operating environment around the core:
 - platform IPC transport
 - structured logs, panic capture, and health aggregation
 - foreground daemon loop
+- product-side builtin/native-runner assembly and long-lived event-source lifecycle
 
 It deliberately does not implement Agent, Bot, QQBot, model provider, Python SDK, plugin marketplace,
 or GUI/business logic. Those belong in Core, StdPlugins, runner kits, or UI hosts.
