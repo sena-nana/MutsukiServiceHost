@@ -18,6 +18,8 @@
 
 - ServiceHost 管运行环境；Core 管任务系统；插件管领域能力。
 - 不在 Host 中加入 Agent/Bot/Provider/Python SDK 业务逻辑。
+- Core、StdPlugins、AgentKit、BotPlugins、Runner Kit、Core adapter、SDK 和业务插件必须由所属仓库实现；Host 只能接入其公开 API、协议或真实 crate，禁止复制、重写、内建替代或生产 fallback/shim。
+- 上游能力缺失时必须 fail loud/unavailable，先补齐上游并更新依赖，不得把职责下沉到 Host；test double 仅限测试路径。
 - 插件和 Runner 能力必须真实接入对应后端；禁止做看似可用但未接线的 UI/CLI 输出。
 - 修复问题先定位根因，选择正确层级修正，禁止只为绕过症状打补丁。
 - 配置、控制 API、Runner 环境、secret 和日志必须默认安全：本地访问、token 鉴权、secret 不进普通日志、外部 Runner 不默认继承完整环境。

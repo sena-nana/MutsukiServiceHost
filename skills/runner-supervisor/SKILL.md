@@ -7,6 +7,7 @@
 - ServiceHost 负责启动、监控、重启、停止 external runner。
 - Python/Rust/ABI Runner 的协议实现属于对应 runner kit 或 Core adapter。
 - 外部 Runner 不默认继承完整宿主环境。
+- SDK、Runner Kit 和 Core adapter 由所属仓库实现；能力缺失时先补齐上游并更新依赖，Host 只报告 unsupported/unavailable，不得提供本地替代或私有协议。
 
 ## 要求
 
