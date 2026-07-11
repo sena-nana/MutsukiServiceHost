@@ -38,6 +38,8 @@ enum Command {
     #[command(subcommand)]
     Runner(RunnerCommand),
     #[command(subcommand)]
+    EventSource(EventSourceCommand),
+    #[command(subcommand)]
     Task(TaskCommand),
 }
 
@@ -52,6 +54,12 @@ enum RunnerCommand {
     List,
     Restart { id: String },
     Stop { id: String },
+}
+
+#[derive(Subcommand)]
+enum EventSourceCommand {
+    List,
+    Restart { id: String },
 }
 
 #[derive(Subcommand)]
@@ -139,6 +147,19 @@ async fn main() -> anyhow::Result<()> {
                 request_and_print(
                     &config,
                     ControlMethod::RunnerStop,
+                    serde_json::to_value(IdParam { id })?,
+                )
+                .await?
+            }
+        },
+        Command::EventSource(command) => match command {
+            EventSourceCommand::List => {
+                request_and_print(&config, ControlMethod::EventSourceList, Value::Null).await?
+            }
+            EventSourceCommand::Restart { id } => {
+                request_and_print(
+                    &config,
+                    ControlMethod::EventSourceRestart,
                     serde_json::to_value(IdParam { id })?,
                 )
                 .await?

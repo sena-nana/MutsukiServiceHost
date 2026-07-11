@@ -95,6 +95,10 @@ Successful reload response:
 
 `event_source_list` returns source id, plugin id, instance id, lifecycle state, health, last error, reconnect count, and last successful task-submission time. `event_source_restart` accepts `{ "id": "source-id" }`. Event sources are product-scoped and remain running during `plugin_reload`; the response makes this explicit with `"event_sources":"kept"`.
 
+The generic CLI exposes the same authenticated operations as
+`mutsuki-service event-source list` and
+`mutsuki-service event-source restart <source-id>`.
+
 `plugin_call` dispatches to loaded host control facades. These facades are not a parallel business
 runtime path; Core task/resource work must go through `HostContext`.
 

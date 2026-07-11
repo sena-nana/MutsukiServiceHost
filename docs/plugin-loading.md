@@ -34,6 +34,13 @@ If a requested builtin was not linked into the binary, startup fails with `Built
 
 Product binaries can add native plugins without editing ServiceHost's internal registry by using `ServiceRuntimeBuilder::register_builtin_plugin`. Their native runners must be supplied through `register_builtin_runner` as recreatable factories; the same factories are used for initial boot and generation reload. Product registrations are frozen before Core resolves the runtime profile/load plan.
 
+An orchestration runner that genuinely needs the SDK `RuntimeClient` can use
+`register_runtime_client_runner`. The factory is still boot-time only and is
+recreated for each registry generation; receiving a client does not authorize
+new manifests, protocols, bindings, or runtime runner registration. Ordinary
+child work should continue to use `RunnerResult.tasks`; tasks submitted through
+the client still enter the normal TaskPool and lease path.
+
 `HostPlugin` remains a control-plane facade and must not become a parallel business runtime path.
 
 `plugin_reload` uses the same loader path as startup. The host rescans and validates manifests,

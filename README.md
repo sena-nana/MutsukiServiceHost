@@ -54,6 +54,7 @@ In another shell:
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token status
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token health
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin list
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token event-source list
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token tui
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token stop
 ```

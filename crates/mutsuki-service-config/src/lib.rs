@@ -23,13 +23,18 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("configured directory is not readable and writable {path}: {source}")]
+    DirectoryAccess {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("control token is required; set MUTSUKI_CONTROL_TOKEN or configure [ipc].token")]
     MissingControlToken,
 }
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
     #[serde(default)]
     pub service: ServiceSection,
@@ -338,6 +343,7 @@ impl ServiceConfig {
                 path: path.clone(),
                 source,
             })?;
+            verify_directory_access(path)?;
         }
         Ok(())
     }
@@ -368,18 +374,22 @@ impl ServiceConfig {
     }
 }
 
-impl Default for ServiceConfig {
-    fn default() -> Self {
-        Self {
-            service: ServiceSection::default(),
-            core: CoreSection::default(),
-            ipc: IpcSection::default(),
-            plugins: PluginsSection::default(),
-            runners: RunnersSection::default(),
-            observe: ObserveSection::default(),
-            security: SecuritySection::default(),
-        }
-    }
+fn verify_directory_access(path: &Path) -> ConfigResult<()> {
+    let access_error = |source| ConfigError::DirectoryAccess {
+        path: path.to_path_buf(),
+        source,
+    };
+    fs::read_dir(path).map_err(&access_error)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let probe = path.join(format!(
+        ".mutsuki-access-probe-{}-{nonce:x}",
+        std::process::id()
+    ));
+    fs::write(&probe, []).map_err(&access_error)?;
+    fs::remove_file(probe).map_err(access_error)
 }
 
 fn default_home_dir() -> PathBuf {
@@ -451,4 +461,18 @@ pub fn filtered_environment(
     }
     envs.extend(extra);
     envs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_access_probe_is_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+
+        verify_directory_access(dir.path()).unwrap();
+
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
 }

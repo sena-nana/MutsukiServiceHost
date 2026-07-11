@@ -22,6 +22,9 @@ pub struct HostEventSourceDescriptor {
     pub source_id: String,
     pub plugin_id: String,
     pub instance_id: String,
+    /// Secret keys that must resolve through the Host secret backend before
+    /// any runtime component is started. Values are never stored here.
+    pub required_secrets: Vec<String>,
 }
 
 impl HostEventSourceDescriptor {
@@ -31,11 +34,17 @@ impl HostEventSourceDescriptor {
             instance_id: source_id.clone(),
             source_id,
             plugin_id: plugin_id.into(),
+            required_secrets: Vec::new(),
         }
     }
 
     pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
         self.instance_id = instance_id.into();
+        self
+    }
+
+    pub fn require_secret(mut self, key: impl Into<String>) -> Self {
+        self.required_secrets.push(key.into());
         self
     }
 }
@@ -67,7 +76,7 @@ pub struct HostEventSourceConfig {
 }
 
 impl HostEventSourceConfig {
-    fn from_service(config: &ServiceConfig) -> Self {
+    pub(crate) fn from_service(config: &ServiceConfig) -> Self {
         Self {
             instance_id: config.service.instance_id.clone(),
             profile: config.service.profile.clone(),
@@ -99,6 +108,10 @@ impl HostEventSourceConfig {
             })
             .collect::<String>();
         std::env::var(format!("{}{key}", self.secret_env_prefix)).ok()
+    }
+
+    pub(crate) fn contains_secret(&self, key: &str) -> bool {
+        self.secret(key).is_some_and(|value| !value.is_empty())
     }
 }
 
@@ -569,6 +582,31 @@ mod tests {
         supervisor.shutdown(Duration::from_millis(20)).await;
     }
 
+    #[tokio::test]
+    async fn explicit_restart_exposes_restarting_until_graceful_stop_finishes() {
+        let supervisor = EventSourceSupervisor::default();
+        supervisor.start(
+            Box::new(HangingShutdownSource {
+                descriptor: HostEventSourceDescriptor::new("restart-visible", "test.plugin"),
+            }),
+            Arc::new(NoopSubmitter),
+            &test_config(),
+            Duration::from_millis(100),
+        );
+        wait_for_state(&supervisor, "running").await;
+
+        supervisor
+            .restart("restart-visible")
+            .await
+            .expect("restart command");
+        wait_for_state(&supervisor, "restarting").await;
+        assert_eq!(supervisor.list()[0].state, "restarting");
+        assert_eq!(supervisor.list()[0].reconnects, 1);
+
+        wait_for_state(&supervisor, "failed").await;
+        supervisor.shutdown(Duration::from_millis(100)).await;
+    }
+
     async fn wait_for_state(supervisor: &EventSourceSupervisor, expected: &str) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -622,7 +660,7 @@ mod tests {
             let start = self.starts.fetch_add(1, Ordering::SeqCst);
             if start == 0 {
                 Box::pin(async {
-                    panic!("gateway panic");
+                    panic!("event source panic");
                     #[allow(unreachable_code)]
                     Ok(())
                 })

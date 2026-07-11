@@ -4,18 +4,20 @@ use std::future::Future;
 use std::io::Write;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use mutsuki_runtime_contracts::{
     CancelPolicy, PluginDeploymentKind, RunnerDescriptor, RuntimeProfile, RuntimeProfileMode,
-    SurfaceCompatibility, TaskHandle, TaskOutcome, TaskStatus,
+    SurfaceCompatibility, TaskBatch, TaskHandle, TaskOutcome, TaskStatus,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
     JsonlRunner, RuntimeBootstrapper,
 };
+use mutsuki_runtime_sdk::{RuntimeClient, RuntimeClientRef, TaskSubmitterRuntimeClient};
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
@@ -46,6 +48,41 @@ pub use event_source::{
 };
 
 type NativeRunnerFactory = Arc<dyn Fn() -> Box<dyn Runner> + Send + Sync>;
+
+#[derive(Default)]
+struct DeferredRuntimeClient(OnceLock<RuntimeClientRef>);
+
+impl DeferredRuntimeClient {
+    fn bind(&self, client: RuntimeClientRef) {
+        assert!(self.0.set(client).is_ok(), "runtime client already bound");
+    }
+
+    fn client(&self) -> RuntimeResult<RuntimeClientRef> {
+        self.0.get().cloned().ok_or_else(|| {
+            RuntimeFailure::new(mutsuki_runtime_contracts::RuntimeError::new(
+                mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+                "mutsuki.service.runtime",
+                "runtime_client.not_bound",
+            ))
+        })
+    }
+}
+
+impl RuntimeClient for DeferredRuntimeClient {
+    fn submit_batch(&self, batch: TaskBatch) -> RuntimeResult<Vec<TaskHandle>> {
+        self.client()?.submit_batch(batch)
+    }
+
+    fn task_outcome(&self, handle: &TaskHandle) -> RuntimeResult<Option<TaskOutcome>> {
+        self.client()?.task_outcome(handle)
+    }
+
+    fn register_waker(&self, handle: &TaskHandle, waker: &Waker) {
+        if let Ok(client) = self.client() {
+            client.register_waker(handle, waker);
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceRuntimeError {
@@ -84,6 +121,7 @@ pub struct ServiceRuntimeBuilder {
     config: ServiceConfig,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    runtime_client: Arc<DeferredRuntimeClient>,
     event_sources: Vec<Box<dyn HostEventSource>>,
 }
 
@@ -124,6 +162,7 @@ impl ServiceRuntimeBuilder {
             config,
             builtin_registry: builtin_registry(),
             native_runner_factories: Vec::new(),
+            runtime_client: Arc::new(DeferredRuntimeClient::default()),
             event_sources: Vec::new(),
         }
     }
@@ -149,6 +188,17 @@ impl ServiceRuntimeBuilder {
         self
     }
 
+    /// Registers a recreatable runner that needs the booted runtime client for nested calls.
+    pub fn register_runtime_client_runner<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(RuntimeClientRef) -> Box<dyn Runner> + Send + Sync + 'static,
+    {
+        let client = self.runtime_client.clone();
+        self.native_runner_factories
+            .push(Arc::new(move || factory(client.clone())));
+        self
+    }
+
     pub fn register_event_source(mut self, source: Box<dyn HostEventSource>) -> Self {
         self.event_sources.push(source);
         self
@@ -159,9 +209,10 @@ impl ServiceRuntimeBuilder {
             config,
             builtin_registry,
             native_runner_factories,
+            runtime_client,
             event_sources,
         } = self;
-        validate_event_sources(&event_sources)?;
+        validate_event_sources(&event_sources, &config)?;
         let observe = mutsuki_service_observe::init_observe(&config);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (core_pump_shutdown, core_pump_rx) = watch::channel(false);
@@ -170,6 +221,8 @@ impl ServiceRuntimeBuilder {
         let catalog = load_catalog(&config, &builtin_registry)?;
         let host_runtime = boot_core(&config, &catalog, &native_runner_factories)?;
         let task_submitter = host_runtime.host_context().task_submitter_ref();
+        runtime_client
+            .bind(TaskSubmitterRuntimeClient::new(task_submitter.clone()).into_runtime_client());
         start_supervised_sidecars(&config, &catalog, &supervisor).await;
 
         let inner = Arc::new(ServiceRuntimeInner {
@@ -206,8 +259,12 @@ impl ServiceRuntimeBuilder {
     }
 }
 
-fn validate_event_sources(sources: &[Box<dyn HostEventSource>]) -> ServiceRuntimeResult<()> {
+fn validate_event_sources(
+    sources: &[Box<dyn HostEventSource>],
+    config: &ServiceConfig,
+) -> ServiceRuntimeResult<()> {
     let mut ids = BTreeSet::new();
+    let source_config = HostEventSourceConfig::from_service(config);
     for source in sources {
         let descriptor = source.descriptor();
         if descriptor.source_id.trim().is_empty()
@@ -223,6 +280,21 @@ fn validate_event_sources(sources: &[Box<dyn HostEventSource>]) -> ServiceRuntim
                 "duplicate event source id {}",
                 descriptor.source_id
             )));
+        }
+        let mut secret_keys = BTreeSet::new();
+        for key in &descriptor.required_secrets {
+            if key.trim().is_empty() || !secret_keys.insert(key) {
+                return Err(ServiceRuntimeError::EventSource(format!(
+                    "event source {} must declare non-empty unique required secret keys",
+                    descriptor.source_id
+                )));
+            }
+            if !source_config.contains_secret(key) {
+                return Err(ServiceRuntimeError::EventSource(format!(
+                    "event source {} requires missing Host secret {}",
+                    descriptor.source_id, key
+                )));
+            }
         }
     }
     Ok(())
@@ -678,6 +750,7 @@ fn load_catalog(
 }
 
 fn builtin_registry() -> BuiltinRegistry {
+    #[allow(unused_mut)]
     let mut registry = BuiltinRegistry::new();
     #[cfg(feature = "conversation-sim")]
     registry.register(mutsuki_service_plugin_conversation_sim::plugin());
@@ -782,7 +855,6 @@ fn runtime_bootstrapper(
     for factory in native_runner_factories {
         bootstrapper.register_builtin_runner(factory());
     }
-
     Ok((
         bootstrapper,
         RuntimeProfile {
@@ -1594,8 +1666,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_source_required_secret_is_validated_before_runtime_start() {
+        let secret_key = format!("MISSING_EVENT_SOURCE_SECRET_{}", std::process::id());
+        let sources: Vec<Box<dyn HostEventSource>> = vec![Box::new(FailingEventSource {
+            descriptor: HostEventSourceDescriptor::new("secret-source", "test.source")
+                .require_secret(secret_key.clone()),
+        })];
+
+        let error = validate_event_sources(&sources, &ServiceConfig::default())
+            .expect_err("missing required Host secret must fail preflight");
+
+        assert!(matches!(
+            error,
+            ServiceRuntimeError::EventSource(message)
+                if message.contains("secret-source") && message.contains(&secret_key)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn product_builder_event_source_runs_real_three_stage_echo_chain() {
+    async fn product_builder_event_source_runs_real_three_stage_pipeline() {
         let dir = tempdir().expect("temp dir");
         std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
         std::fs::create_dir_all(dir.path().join("run")).expect("run");
@@ -1611,44 +1701,58 @@ mod tests {
         config.plugins.disabled_dir = dir.path().join("disabled");
         config.runners.graceful_shutdown_ms = 250;
 
-        let echo_count = Arc::new(AtomicUsize::new(0));
+        let terminal_count = Arc::new(AtomicUsize::new(0));
         let source_starts = Arc::new(AtomicUsize::new(0));
         let source_stops = Arc::new(AtomicUsize::new(0));
-        let source = MockGatewaySource {
-            descriptor: HostEventSourceDescriptor::new("mock-gateway", "test.gateway"),
+        let client_factory_count = Arc::new(AtomicUsize::new(0));
+        let client_checks = Arc::new(AtomicUsize::new(0));
+        let source = MockEventSource {
+            descriptor: HostEventSourceDescriptor::new("mock-source", "test.source"),
             starts: source_starts.clone(),
             stops: source_stops.clone(),
         };
-        let router_descriptor =
-            chain_descriptor("test.router", "test.router.runner", "bot.gateway");
-        let command_descriptor =
-            chain_descriptor("test.command", "test.command.runner", "bot.command.parse");
-        let echo_descriptor = chain_descriptor("test.echo", "test.echo.runner", "bot.command.echo");
+        let first_descriptor =
+            chain_descriptor("test.stage.first", "test.stage.first.runner", "test.input");
+        let second_descriptor = chain_descriptor(
+            "test.stage.second",
+            "test.stage.second.runner",
+            "test.intermediate",
+        );
+        let terminal_descriptor = chain_descriptor(
+            "test.stage.terminal",
+            "test.stage.terminal.runner",
+            "test.output",
+        );
 
-        let router_factory_descriptor = router_descriptor.clone();
-        let command_factory_descriptor = command_descriptor.clone();
-        let echo_factory_descriptor = echo_descriptor.clone();
-        let echo_factory_count = echo_count.clone();
+        let first_factory_descriptor = first_descriptor.clone();
+        let second_factory_descriptor = second_descriptor.clone();
+        let second_factory_count = client_factory_count.clone();
+        let second_client_checks = client_checks.clone();
+        let terminal_factory_descriptor = terminal_descriptor.clone();
+        let terminal_factory_count = terminal_count.clone();
         let runtime = ServiceRuntimeBuilder::new(config)
-            .register_builtin_plugin(runner_manifest("test.router", router_descriptor))
-            .register_builtin_plugin(runner_manifest("test.command", command_descriptor))
-            .register_builtin_plugin(runner_manifest("test.echo", echo_descriptor))
+            .register_builtin_plugin(runner_manifest("test.stage.first", first_descriptor))
+            .register_builtin_plugin(runner_manifest("test.stage.second", second_descriptor))
+            .register_builtin_plugin(runner_manifest("test.stage.terminal", terminal_descriptor))
             .register_builtin_runner(move || {
                 Box::new(ChainRunner::next(
-                    router_factory_descriptor.clone(),
-                    "bot.command.parse",
+                    first_factory_descriptor.clone(),
+                    "test.intermediate",
                 ))
             })
-            .register_builtin_runner(move || {
-                Box::new(ChainRunner::next(
-                    command_factory_descriptor.clone(),
-                    "bot.command.echo",
+            .register_runtime_client_runner(move |client| {
+                second_factory_count.fetch_add(1, Ordering::SeqCst);
+                Box::new(ChainRunner::next_with_client(
+                    second_factory_descriptor.clone(),
+                    "test.output",
+                    client,
+                    second_client_checks.clone(),
                 ))
             })
             .register_builtin_runner(move || {
                 Box::new(ChainRunner::terminal(
-                    echo_factory_descriptor.clone(),
-                    echo_factory_count.clone(),
+                    terminal_factory_descriptor.clone(),
+                    terminal_factory_count.clone(),
                 ))
             })
             .register_event_source(Box::new(source))
@@ -1656,7 +1760,9 @@ mod tests {
             .await
             .expect("real service runtime starts");
 
-        wait_for_count(&echo_count, 1).await;
+        wait_for_count(&terminal_count, 1).await;
+        assert_eq!(client_factory_count.load(Ordering::SeqCst), 1);
+        assert_eq!(client_checks.load(Ordering::SeqCst), 1);
         let snapshots = runtime
             .inner
             .host_runtime
@@ -1709,7 +1815,7 @@ mod tests {
         let health: HealthReport =
             serde_json::from_value(health.result.expect("health")).expect("health report");
         assert_eq!(health.event_sources, "ok");
-        assert_eq!(health.event_source_details[0].source_id, "mock-gateway");
+        assert_eq!(health.event_source_details[0].source_id, "mock-source");
 
         let reload = runtime.inner.plugin_reload().await;
         assert!(reload.ok);
@@ -1717,17 +1823,19 @@ mod tests {
             serde_json::from_value(reload.result.expect("reload")).expect("reload response");
         assert_eq!(reload.event_sources, "kept");
         assert_eq!(source_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(client_factory_count.load(Ordering::SeqCst), 2);
 
         let restart = runtime
             .inner
             .handle_request(ControlRequest {
                 token: "test-token".into(),
                 method: ControlMethod::EventSourceRestart,
-                params: json!({ "id": "mock-gateway" }),
+                params: json!({ "id": "mock-source" }),
             })
             .await;
         assert!(restart.ok);
-        wait_for_count(&echo_count, 2).await;
+        wait_for_count(&terminal_count, 2).await;
+        assert_eq!(client_checks.load(Ordering::SeqCst), 2);
         let sources = runtime.inner.event_sources.list();
         assert_eq!(sources[0].reconnects, 1);
         assert_eq!(sources[0].state, "running");
@@ -1750,8 +1858,8 @@ mod tests {
         config.plugins.dynamic_dirs.clear();
         config.runners.graceful_shutdown_ms = 50;
         let runtime = ServiceRuntimeBuilder::new(config)
-            .register_event_source(Box::new(FailingGatewaySource {
-                descriptor: HostEventSourceDescriptor::new("failed-gateway", "test.gateway"),
+            .register_event_source(Box::new(FailingEventSource {
+                descriptor: HostEventSourceDescriptor::new("failed-source", "test.source"),
             }))
             .start()
             .await
@@ -1770,7 +1878,7 @@ mod tests {
         assert_eq!(health.service, "ok");
         assert_eq!(health.core, "ok");
         assert_eq!(health.event_sources, "degraded");
-        assert!(health.recent_errors[0].contains("failed-gateway"));
+        assert!(health.recent_errors[0].contains("failed-source"));
         runtime.shutdown().await;
     }
 
@@ -1784,23 +1892,23 @@ mod tests {
         .expect("runtime completed chain");
     }
 
-    struct MockGatewaySource {
+    struct MockEventSource {
         descriptor: HostEventSourceDescriptor,
         starts: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
     }
 
-    struct FailingGatewaySource {
+    struct FailingEventSource {
         descriptor: HostEventSourceDescriptor,
     }
 
-    impl HostEventSource for FailingGatewaySource {
+    impl HostEventSource for FailingEventSource {
         fn descriptor(&self) -> &HostEventSourceDescriptor {
             &self.descriptor
         }
 
         fn start(&mut self, _ctx: HostEventSourceContext) -> HostEventSourceFuture {
-            Box::pin(async { Err(std::io::Error::other("gateway disconnected").into()) })
+            Box::pin(async { Err(std::io::Error::other("upstream disconnected").into()) })
         }
 
         fn shutdown(&mut self) -> HostEventSourceFuture {
@@ -1808,11 +1916,11 @@ mod tests {
         }
 
         fn health(&self) -> HostEventSourceHealth {
-            HostEventSourceHealth::Unhealthy("gateway disconnected".into())
+            HostEventSourceHealth::Unhealthy("upstream disconnected".into())
         }
     }
 
-    impl HostEventSource for MockGatewaySource {
+    impl HostEventSource for MockEventSource {
         fn descriptor(&self) -> &HostEventSourceDescriptor {
             &self.descriptor
         }
@@ -1821,9 +1929,9 @@ mod tests {
             let sequence = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             Box::pin(async move {
                 let mut task = Task::new(
-                    format!("mock-gateway-{sequence}"),
-                    "bot.gateway",
-                    json!({ "text": "/echo hello" }),
+                    format!("mock-source-{sequence}"),
+                    "test.input",
+                    json!({ "value": "pipeline input" }),
                 );
                 task.correlation_id = Some(format!("corr-mock-{sequence}"));
                 ctx.task_submitter.submit_task(task)?;
@@ -1847,6 +1955,8 @@ mod tests {
         descriptor: RunnerDescriptor,
         next_protocol: Option<&'static str>,
         terminal_count: Option<Arc<AtomicUsize>>,
+        runtime_client: Option<RuntimeClientRef>,
+        client_checks: Option<Arc<AtomicUsize>>,
     }
 
     impl ChainRunner {
@@ -1855,6 +1965,23 @@ mod tests {
                 descriptor,
                 next_protocol: Some(next_protocol),
                 terminal_count: None,
+                runtime_client: None,
+                client_checks: None,
+            }
+        }
+
+        fn next_with_client(
+            descriptor: RunnerDescriptor,
+            next_protocol: &'static str,
+            runtime_client: RuntimeClientRef,
+            client_checks: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                descriptor,
+                next_protocol: Some(next_protocol),
+                terminal_count: None,
+                runtime_client: Some(runtime_client),
+                client_checks: Some(client_checks),
             }
         }
 
@@ -1863,6 +1990,8 @@ mod tests {
                 descriptor,
                 next_protocol: None,
                 terminal_count: Some(count),
+                runtime_client: None,
+                client_checks: None,
             }
         }
     }
@@ -1879,7 +2008,29 @@ mod tests {
         ) -> RuntimeResult<CompletionBatch> {
             let next_protocol = self.next_protocol;
             let terminal_count = self.terminal_count.clone();
+            let runtime_client = self.runtime_client.clone();
+            let client_checks = self.client_checks.clone();
             map_work_batch_entries(&batch, |task| {
+                if let Some(client) = &runtime_client {
+                    let handle = TaskHandle {
+                        task_id: task.task_id.clone(),
+                        protocol_id: task.protocol_id.clone(),
+                        target_binding_id: task.target_binding_id.clone(),
+                        cancel_policy: CancelPolicy::Cascade,
+                        trace_id: task.trace_id.clone(),
+                        correlation_id: task.correlation_id.clone(),
+                    };
+                    let _ = client.task_outcome(&handle).map_err(|error| {
+                        mutsuki_runtime_contracts::RuntimeError::new(
+                            mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+                            "test.stage.second",
+                            format!("runtime_client.outcome:{error}"),
+                        )
+                    })?;
+                    if let Some(checks) = &client_checks {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 let mut result = mutsuki_runtime_contracts::RunnerResult::completed(&task.task_id);
                 if let Some(protocol) = next_protocol {
                     let mut next = Task::new(

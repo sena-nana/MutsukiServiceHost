@@ -37,7 +37,17 @@ The service host does not own task scheduling. Core remains the source of truth 
 
 `ServiceRuntimeBuilder` is the only product-side registration window. Product manifests are added to the builtin catalog before `RuntimeProfile` and the Core load plan are resolved. Native runners are registered as factories so reload can construct a fresh generation; runtime registration remains disabled.
 
+Runtime-client-aware runner factories use the same frozen registration window.
+The Host binds their generic SDK client only after Core boot and recreates the
+runner on reload; this is not a dynamic registration path or a domain-specific
+service API.
+
 `HostEventSource` represents a long-lived external connection. Its context exposes only a Core `TaskSubmitter`, a shutdown token, read-only non-secret service configuration, environment-backed secret lookup, structured logging, and the source instance id. It cannot access `TaskPool`, `StateStore`, or `EventLog`. The host isolates source errors and panics, tracks lifecycle/health, supports explicit restart, and bounds shutdown by the configured graceful timeout.
+
+An event source can declare required secret keys on its descriptor. ServiceHost
+resolves only their presence through the configured Host secret backend before
+Core, IPC, runners, or event sources start, so missing credentials fail loud
+without moving secret loading into a domain plugin.
 
 The service tick loop drives tasks submitted by event sources through the normal Core lease, batch runner, completion, and `ResultRouter` path. Plugin reload keeps event sources running; native runners are drained and recreated for the new Core generation.
 
