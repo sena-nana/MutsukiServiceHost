@@ -33,10 +33,10 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 windows-service = "0.8.1"
 
-mutsuki-runtime-contracts = { path = "../MutsukiCore/crates/mutsuki-runtime-contracts" }
-mutsuki-runtime-core = { path = "../MutsukiCore/crates/mutsuki-runtime-core" }
-mutsuki-runtime-host = { path = "../MutsukiCore/crates/mutsuki-runtime-host" }
-mutsuki-runtime-sdk = { path = "../MutsukiCore/crates/mutsuki-runtime-sdk" }
+mutsuki-runtime-contracts = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "cb6527b81b21c8c3c5a9c12cea3445a26b796acf" }
+mutsuki-runtime-core = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "cb6527b81b21c8c3c5a9c12cea3445a26b796acf" }
+mutsuki-runtime-host = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "cb6527b81b21c8c3c5a9c12cea3445a26b796acf" }
+mutsuki-runtime-sdk = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "cb6527b81b21c8c3c5a9c12cea3445a26b796acf" }
 
 mutsuki-service-config = { path = "crates/mutsuki-service-config" }
 mutsuki-service-plugin-loader = { path = "crates/mutsuki-service-plugin-loader" }

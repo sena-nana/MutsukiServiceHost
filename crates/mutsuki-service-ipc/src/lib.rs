@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
-use mutsuki_service_config::{IpcTransport, ServiceConfig};
-use mutsuki_service_control::{ControlHandler, ControlRequest, ControlResponse};
+use std::path::Path;
+
+pub use mutsuki_service_config::IpcTransport;
+use mutsuki_service_config::ServiceConfig;
+use mutsuki_service_control::{ControlHandler, ControlMethod, ControlRequest, ControlResponse};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 
@@ -19,6 +23,86 @@ pub type IpcResult<T> = Result<T, IpcError>;
 
 pub struct IpcServer {
     handle: JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlClientConfig {
+    pub transport: IpcTransport,
+    pub endpoint: String,
+    pub token: String,
+}
+
+impl ControlClientConfig {
+    pub fn new(
+        transport: IpcTransport,
+        endpoint: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            transport,
+            endpoint: endpoint.into(),
+            token: token.into(),
+        }
+    }
+}
+
+impl From<&ServiceConfig> for ControlClientConfig {
+    fn from(config: &ServiceConfig) -> Self {
+        Self::new(
+            config.ipc.transport.clone(),
+            config.ipc_endpoint(),
+            config.control_token(),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlClient {
+    config: ControlClientConfig,
+}
+
+impl ControlClient {
+    pub fn new(config: ControlClientConfig) -> Self {
+        Self { config }
+    }
+
+    pub async fn request(
+        &self,
+        method: ControlMethod,
+        params: Value,
+    ) -> IpcResult<ControlResponse> {
+        self.send(ControlRequest {
+            token: self.config.token.clone(),
+            method,
+            params,
+        })
+        .await
+    }
+
+    pub async fn send(&self, request: ControlRequest) -> IpcResult<ControlResponse> {
+        request_endpoint(
+            self.config.transport.clone(),
+            self.config.endpoint.clone(),
+            request,
+        )
+        .await
+    }
+}
+
+pub fn default_control_endpoint(
+    transport: IpcTransport,
+    name: &str,
+    run_dir: &Path,
+    tcp_debug_addr: Option<&str>,
+) -> String {
+    match transport {
+        IpcTransport::NamedPipe => name.to_string(),
+        IpcTransport::UnixSocket => run_dir
+            .join(format!("{name}.sock"))
+            .to_string_lossy()
+            .into_owned(),
+        IpcTransport::TcpDebug => tcp_debug_addr.unwrap_or("127.0.0.1:7687").to_string(),
+    }
 }
 
 impl IpcServer {
@@ -43,12 +127,12 @@ pub async fn start_server(
     Ok(Some(IpcServer { handle }))
 }
 
-pub async fn request(
-    config: &ServiceConfig,
+async fn request_endpoint(
+    transport: IpcTransport,
+    endpoint: String,
     request: ControlRequest,
 ) -> IpcResult<ControlResponse> {
-    let endpoint = config.ipc_endpoint();
-    match config.ipc.transport {
+    match transport {
         IpcTransport::NamedPipe => request_named_pipe(endpoint, request).await,
         IpcTransport::UnixSocket => request_unix_socket(endpoint, request).await,
         IpcTransport::TcpDebug => request_tcp_debug(endpoint, request).await,
@@ -237,4 +321,31 @@ async fn start_tcp_debug_server(
 async fn request_tcp_debug(addr: String, request: ControlRequest) -> IpcResult<ControlResponse> {
     let stream = tokio::net::TcpStream::connect(addr).await?;
     send_stream(stream, request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_helper_is_transport_specific() {
+        let run_dir = Path::new("runtime");
+        assert_eq!(
+            default_control_endpoint(IpcTransport::NamedPipe, "mutsuki", run_dir, None),
+            "mutsuki"
+        );
+        assert!(
+            default_control_endpoint(IpcTransport::UnixSocket, "mutsuki", run_dir, None)
+                .ends_with("mutsuki.sock")
+        );
+        assert_eq!(
+            default_control_endpoint(
+                IpcTransport::TcpDebug,
+                "mutsuki",
+                run_dir,
+                Some("127.0.0.1:9000")
+            ),
+            "127.0.0.1:9000"
+        );
+    }
 }

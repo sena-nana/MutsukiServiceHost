@@ -20,8 +20,8 @@ cwd = "optional-working-directory"
 runner_link = "jsonl-stdio"
 ```
 
-`jsonl-stdio` is the first Core-connected runner link. ServiceHost wraps the child process with
-`mutsuki-runtime-host::JsonlRunner` (`runner.run_batch`). Other external processes can still be
+`jsonl-stdio` is the first Core-connected runner link. ServiceHost resolves the exact environment
+and launches the child through `mutsuki-runtime-host::SpawnedJsonlRunner` (`runner.run_batch`). Other external processes can still be
 supervised as sidecars, but they are not advertised to Core as executable runners.
 
 The default ServiceHost build links no builtin plugins. Product binaries may link real plugin crates
@@ -36,7 +36,8 @@ new manifests, protocols, bindings, or runtime runner registration. Ordinary
 child work should continue to use `RunnerResult.tasks`; tasks submitted through
 the client still enter the normal TaskPool and lease path.
 
-`HostPlugin` remains a control-plane facade and must not become a parallel business runtime path.
+The builtin registry is manifest-only. ServiceHost does not expose an arbitrary host-call facade;
+domain work must use declared Core task protocols.
 
 `plugin_reload` uses the same loader path as startup. The host rescans and validates manifests,
 prepares a new Core load-plan generation, drains active runtime work, swaps Core through

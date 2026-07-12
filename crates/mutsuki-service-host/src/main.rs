@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use mutsuki_service_config::{ConfigOverrides, ServiceConfig};
-use mutsuki_service_control::{ControlMethod, ControlRequest, IdParam};
+use mutsuki_service_control::{ControlMethod, IdParam};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -198,15 +198,8 @@ async fn request_and_print(
     method: ControlMethod,
     params: Value,
 ) -> anyhow::Result<()> {
-    let response = mutsuki_service_ipc::request(
-        config,
-        ControlRequest {
-            token: config.control_token().to_string(),
-            method,
-            params,
-        },
-    )
-    .await?;
+    let client = mutsuki_service_ipc::ControlClient::new(config.into());
+    let response = client.request(method, params).await?;
     println!("{}", serde_json::to_string_pretty(&json!(response))?);
     Ok(())
 }

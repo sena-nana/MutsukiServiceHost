@@ -21,6 +21,8 @@
 - Core、StdPlugins、AgentKit、BotPlugins、Runner Kit、Core adapter、SDK 和业务插件必须由所属仓库实现；Host 只能接入其公开 API、协议或真实 crate，禁止复制、重写、内建替代或生产 fallback/shim。
 - 上游能力缺失时必须 fail loud/unavailable，先补齐上游并更新依赖，不得把职责下沉到 Host；test double 仅限测试路径。
 - 插件和 Runner 能力必须真实接入对应后端；禁止做看似可用但未接线的 UI/CLI 输出。
+- 控制面不得提供任意插件调用；领域操作必须提交 Core task。公开客户端只接收 endpoint、transport 和 token，不暴露完整 ServiceConfig。
+- JSONL 编解码与通用子进程 transport 使用 Core host helper；本仓库只拥有发现、环境策略、监督、重启和停止。
 - 修复问题先定位根因，选择正确层级修正，禁止只为绕过症状打补丁。
 - 配置、控制 API、Runner 环境、secret 和日志必须默认安全：本地访问、token 鉴权、secret 不进普通日志、外部 Runner 不默认继承完整环境。
 - 禁止仓库外 Cargo `path`/本地 `[patch]`；跨仓库依赖使用远端 Git URL 和固定 `rev`，并在独立 checkout 验证。

@@ -401,6 +401,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-contracts"
 version = "0.1.0"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=cb6527b81b21c8c3c5a9c12cea3445a26b796acf#cb6527b81b21c8c3c5a9c12cea3445a26b796acf"
 dependencies = [
  "serde",
  "serde_json",
@@ -409,6 +410,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-core"
 version = "0.1.0"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=cb6527b81b21c8c3c5a9c12cea3445a26b796acf#cb6527b81b21c8c3c5a9c12cea3445a26b796acf"
 dependencies = [
  "mutsuki-runtime-contracts",
  "serde_json",
@@ -418,6 +420,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-host"
 version = "0.1.0"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=cb6527b81b21c8c3c5a9c12cea3445a26b796acf#cb6527b81b21c8c3c5a9c12cea3445a26b796acf"
 dependencies = [
  "mutsuki-runtime-contracts",
  "mutsuki-runtime-core",
@@ -429,6 +432,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-sdk"
 version = "0.1.0"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=cb6527b81b21c8c3c5a9c12cea3445a26b796acf#cb6527b81b21c8c3c5a9c12cea3445a26b796acf"
 dependencies = [
  "mutsuki-runtime-contracts",
  "mutsuki-runtime-core",
@@ -440,6 +444,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-sdk-macros"
 version = "0.1.0"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=cb6527b81b21c8c3c5a9c12cea3445a26b796acf#cb6527b81b21c8c3c5a9c12cea3445a26b796acf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -521,7 +526,6 @@ version = "0.1.0"
 dependencies = [
  "mutsuki-runtime-contracts",
  "serde",
- "serde_json",
  "thiserror",
  "toml",
 ]

@@ -3,34 +3,33 @@ use std::future::Future;
 #[cfg(test)]
 use std::io::Write;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use mutsuki_runtime_contracts::{
-    CancelPolicy, PluginDeploymentKind, RunnerDescriptor, RuntimeProfile, RuntimeProfileMode,
-    SurfaceCompatibility, TaskBatch, TaskHandle, TaskOutcome, TaskStatus,
+    CancelPolicy, PluginDeploymentKind, RuntimeProfile, RuntimeProfileMode, SurfaceCompatibility,
+    TaskBatch, TaskHandle, TaskOutcome, TaskStatus,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
+#[cfg(test)]
+use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
-    JsonlRunner, RuntimeBootstrapper,
+    ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner,
 };
 use mutsuki_runtime_sdk::{RuntimeClient, RuntimeClientRef, TaskSubmitterRuntimeClient};
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
-    PluginCallParams, PluginReloadChange, PluginReloadResponse, PluginStatus,
-    RunnerStatus as ControlRunnerStatus, ServiceStatus,
-    TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
+    PluginReloadChange, PluginReloadResponse, PluginStatus, RunnerStatus as ControlRunnerStatus,
+    ServiceStatus, TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
     TaskSnapshot as ControlTaskSnapshot,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
-    BuiltinRegistry, ExternalRuntimeSpec, HostPluginCallError, PluginCatalog, PluginLoaderError,
-    PluginRecord,
+    BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginLoaderError, PluginRecord,
 };
 use mutsuki_service_runner_supervisor::{
     ManagedRunnerSpec, RunnerProcessState, RunnerSnapshot, RunnerSupervisor,
@@ -95,11 +94,8 @@ pub enum ServiceRuntimeError {
     Ipc(#[from] mutsuki_service_ipc::IpcError),
     #[error("external runner link {link} for plugin {plugin_id} is not supported")]
     UnsupportedRunnerLink { plugin_id: String, link: String },
-    #[error("external runner {runner_id} failed to start: {source}")]
-    ExternalRunnerSpawn {
-        runner_id: String,
-        source: std::io::Error,
-    },
+    #[error("external runner {runner_id} failed to start: {detail}")]
+    ExternalRunnerSpawn { runner_id: String, detail: String },
     #[error("service runtime already started")]
     AlreadyStarted,
     #[error("event source registration failed: {0}")]
@@ -438,7 +434,6 @@ impl ServiceRuntimeInner {
             ControlMethod::CoreStatus => self.core_status(),
             ControlMethod::PluginList => self.plugin_list(),
             ControlMethod::PluginReload => self.plugin_reload().await,
-            ControlMethod::PluginCall => self.plugin_call(request.params),
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
@@ -574,36 +569,6 @@ impl ServiceRuntimeInner {
             runner_errors,
             event_sources: "kept".into(),
         })
-    }
-
-    fn plugin_call(&self, params: Value) -> ControlResponse {
-        let params = match serde_json::from_value::<PluginCallParams>(params) {
-            Ok(params) => params,
-            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
-        };
-        let plugin = {
-            let catalog = self.catalog.lock().expect("catalog mutex");
-            catalog.host_plugins.get(&params.plugin_id).cloned()
-        };
-        let Some(plugin) = plugin else {
-            return ControlResponse::err(ControlError::Failed(format!(
-                "plugin {} is not loaded or does not expose host operations",
-                params.plugin_id
-            )));
-        };
-        // HostPlugin is a control-plane facade only; Core task/resource work must use HostContext.
-        match plugin.call(&params.operation, params.payload) {
-            Ok(value) => ControlResponse::ok(value),
-            Err(HostPluginCallError::UnsupportedOperation(operation)) => ControlResponse::err(
-                ControlError::Unsupported(format!("plugin operation {operation}")),
-            ),
-            Err(HostPluginCallError::BadRequest(message)) => {
-                ControlResponse::err(ControlError::BadRequest(message))
-            }
-            Err(HostPluginCallError::Failed(message)) => {
-                ControlResponse::err(ControlError::Failed(message))
-            }
-        }
     }
 
     async fn runner_list(&self) -> ControlResponse {
@@ -925,21 +890,30 @@ fn register_stdio_runners(
         });
     }
     for descriptor in &record.manifest.provides.runners {
-        let runner = OwnedJsonlRunner::spawn(
-            descriptor.clone(),
-            runtime.clone(),
-            config.runners.env_allowlist.clone(),
-            config
-                .service
-                .home_dir
-                .clone()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .map_err(|source| ServiceRuntimeError::ExternalRunnerSpawn {
-            runner_id: descriptor.runner_id.clone(),
-            source,
-        })?;
+        let mut extra_env = runtime.env.clone();
+        extra_env.insert(
+            "MUTSUKI_HOME".into(),
+            config.service.home_dir.to_string_lossy().into_owned(),
+        );
+        extra_env.insert("MUTSUKI_RUNNER_ID".into(), descriptor.runner_id.clone());
+        extra_env.insert("MUTSUKI_PLUGIN_ID".into(), descriptor.plugin_id.clone());
+        let spec = ProcessRunnerSpec {
+            command: runtime.command.clone().into(),
+            args: runtime.args.clone(),
+            cwd: runtime.cwd.clone(),
+            env: filtered_environment(&config.runners.env_allowlist, extra_env),
+        };
+        let mut runner =
+            SpawnedJsonlRunner::spawn(descriptor.clone(), &spec).map_err(|source| {
+                ServiceRuntimeError::ExternalRunnerSpawn {
+                    runner_id: descriptor.runner_id.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+        if let Some(stderr) = runner.take_stderr() {
+            let runner_id = descriptor.runner_id.clone();
+            std::thread::spawn(move || drain_blocking_stderr(runner_id, stderr));
+        }
         bootstrapper.register_external_runner(deployment.clone(), Box::new(runner));
     }
     Ok(())
@@ -1160,79 +1134,6 @@ fn resolve_task_handle(
     })
 }
 
-/// Owns an external JSONL stdio child and delegates protocol to Core `JsonlRunner`.
-struct OwnedJsonlRunner {
-    child: Child,
-    inner: JsonlRunner<BufReader<std::process::ChildStdout>, std::process::ChildStdin>,
-}
-
-impl OwnedJsonlRunner {
-    fn spawn(
-        descriptor: RunnerDescriptor,
-        runtime: ExternalRuntimeSpec,
-        env_allowlist: Vec<String>,
-        home: String,
-    ) -> std::io::Result<Self> {
-        let mut extra_env = runtime.env.clone();
-        extra_env.insert("MUTSUKI_HOME".into(), home);
-        extra_env.insert("MUTSUKI_RUNNER_ID".into(), descriptor.runner_id.clone());
-        extra_env.insert("MUTSUKI_PLUGIN_ID".into(), descriptor.plugin_id.clone());
-        let envs = filtered_environment(&env_allowlist, extra_env);
-        let mut command = Command::new(runtime.command);
-        command
-            .args(runtime.args)
-            .env_clear()
-            .envs(envs)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(cwd) = runtime.cwd {
-            command.current_dir(cwd);
-        }
-        let mut child = command.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("runner stdout unavailable"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("runner stdin unavailable"))?;
-        if let Some(stderr) = child.stderr.take() {
-            let runner_id = descriptor.runner_id.clone();
-            std::thread::spawn(move || drain_blocking_stderr(runner_id, stderr));
-        }
-        Ok(Self {
-            child,
-            inner: JsonlRunner::new(descriptor, BufReader::new(stdout), stdin),
-        })
-    }
-}
-
-impl Runner for OwnedJsonlRunner {
-    fn descriptor(&self) -> &RunnerDescriptor {
-        Runner::descriptor(&self.inner)
-    }
-
-    fn run_batch(
-        &mut self,
-        ctx: mutsuki_runtime_contracts::RunnerContext,
-        batch: mutsuki_runtime_contracts::WorkBatch,
-    ) -> RuntimeResult<mutsuki_runtime_contracts::CompletionBatch> {
-        self.inner.run_batch(ctx, batch)
-    }
-
-    fn cancel(&mut self, invocation_id: &str) -> RuntimeResult<()> {
-        self.inner.cancel(invocation_id)
-    }
-
-    fn dispose(&mut self) -> RuntimeResult<()> {
-        let result = self.inner.dispose();
-        let _ = self.child.kill();
-        result
-    }
-}
-
 fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {
     let reader = BufReader::new(stderr);
     for line in reader.lines().map_while(Result::ok) {
@@ -1248,13 +1149,11 @@ mod tests {
     use mutsuki_runtime_contracts::{
         ArtifactType, CompletionBatch, ExecutionClass, LifecyclePolicy, PermissionGrant,
         PluginArtifact, PluginManifest, PluginProvides, RunnerBatchCapability,
-        RunnerControlCapability, RunnerOrderingCapability, RunnerPayloadCapability, RunnerPurity,
-        RunnerResourceCapability, Task, WorkBatch,
+        RunnerControlCapability, RunnerDescriptor, RunnerOrderingCapability,
+        RunnerPayloadCapability, RunnerPurity, RunnerResourceCapability, Task, WorkBatch,
     };
     use mutsuki_runtime_sdk::map_work_batch_entries;
-    use mutsuki_service_control::{
-        PluginCallParams, PluginReloadResponse, TaskOutcomeView, TaskSnapshot,
-    };
+    use mutsuki_service_control::{PluginReloadResponse, TaskOutcomeView, TaskSnapshot};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1262,36 +1161,9 @@ mod tests {
 
     const TEST_PLUGIN_ID: &str = "test.control.facade";
 
-    struct TestControlPlugin {
-        manifest: PluginManifest,
-    }
-
-    impl mutsuki_service_plugin_loader::HostPlugin for TestControlPlugin {
-        fn manifest(&self) -> &PluginManifest {
-            &self.manifest
-        }
-
-        fn call(
-            &self,
-            operation: &str,
-            payload: Value,
-        ) -> mutsuki_service_plugin_loader::HostPluginCallResult<Value> {
-            match operation {
-                "echo" => Ok(payload),
-                other => Err(HostPluginCallError::UnsupportedOperation(other.into())),
-            }
-        }
-    }
-
-    fn test_control_plugin() -> Arc<dyn mutsuki_service_plugin_loader::HostPlugin> {
-        Arc::new(TestControlPlugin {
-            manifest: minimal_manifest(TEST_PLUGIN_ID),
-        })
-    }
-
     fn test_builtin_registry() -> BuiltinRegistry {
         let mut registry = BuiltinRegistry::new();
-        registry.register(test_control_plugin());
+        registry.register_manifest(minimal_manifest(TEST_PLUGIN_ID));
         registry
     }
 
@@ -1375,68 +1247,6 @@ mod tests {
         .expect_err("filters rejected");
 
         assert!(matches!(error, ControlError::BadRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn plugin_call_checks_auth_and_dispatches_loaded_builtin() {
-        let inner = test_runtime_inner("token");
-
-        let unauthorized = inner
-            .handle_request(ControlRequest {
-                token: "wrong".into(),
-                method: ControlMethod::PluginCall,
-                params: Value::Null,
-            })
-            .await;
-        assert!(!unauthorized.ok);
-        assert_eq!(unauthorized.error.expect("error").code, "unauthorized");
-
-        let success = inner
-            .handle_request(ControlRequest {
-                token: "token".into(),
-                method: ControlMethod::PluginCall,
-                params: json!(PluginCallParams {
-                    plugin_id: TEST_PLUGIN_ID.into(),
-                    operation: "echo".into(),
-                    payload: json!({ "message": "hello" }),
-                }),
-            })
-            .await;
-        assert!(success.ok);
-        assert_eq!(success.result, Some(json!({ "message": "hello" })));
-    }
-
-    #[tokio::test]
-    async fn plugin_call_reports_unknown_plugin_and_operation() {
-        let inner = test_runtime_inner("token");
-
-        let missing = inner
-            .handle_request(ControlRequest {
-                token: "token".into(),
-                method: ControlMethod::PluginCall,
-                params: json!(PluginCallParams {
-                    plugin_id: "missing".into(),
-                    operation: "send".into(),
-                    payload: json!({ "message": "hello" }),
-                }),
-            })
-            .await;
-        assert!(!missing.ok);
-        assert_eq!(missing.error.expect("error").code, "failed");
-
-        let unsupported = inner
-            .handle_request(ControlRequest {
-                token: "token".into(),
-                method: ControlMethod::PluginCall,
-                params: json!(PluginCallParams {
-                    plugin_id: TEST_PLUGIN_ID.into(),
-                    operation: "missing".into(),
-                    payload: Value::Null,
-                }),
-            })
-            .await;
-        assert!(!unsupported.ok);
-        assert_eq!(unsupported.error.expect("error").code, "unsupported");
     }
 
     #[tokio::test]
@@ -2186,30 +1996,6 @@ mod tests {
 
     fn runner_manifest(plugin_id: &str, descriptor: RunnerDescriptor) -> PluginManifest {
         mutsuki_runtime_host::runner_manifest(plugin_id, vec![descriptor])
-    }
-
-    fn test_runtime_inner(token: &str) -> ServiceRuntimeInner {
-        let mut config = ServiceConfig::default();
-        config.ipc.token = Some(token.into());
-        let registry = test_builtin_registry();
-        let selection = registry
-            .load_requested(&[TEST_PLUGIN_ID.into()])
-            .expect("builtin available");
-        let catalog = PluginCatalog::scan(&[], Path::new("missing-disabled"), selection)
-            .expect("catalog scan");
-
-        ServiceRuntimeInner {
-            config,
-            started_at: Instant::now(),
-            catalog: Mutex::new(catalog),
-            host_runtime: Mutex::new(None),
-            supervisor: RunnerSupervisor::new(),
-            event_sources: EventSourceSupervisor::default(),
-            builtin_registry: registry,
-            native_runner_factories: Vec::new(),
-            health_probes: BTreeMap::new(),
-            shutdown_tx: Mutex::new(None),
-        }
     }
 
     fn test_started_runtime_inner(token: &str, root: &Path) -> ServiceRuntimeInner {

@@ -27,7 +27,6 @@ pub enum ControlMethod {
     CoreStatus,
     PluginList,
     PluginReload,
-    PluginCall,
     RunnerList,
     RunnerRestart,
     RunnerStop,
@@ -250,12 +249,4 @@ pub struct LogTailEntry {
 pub struct LogTailResponse {
     pub cursor: u64,
     pub entries: Vec<LogTailEntry>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PluginCallParams {
-    pub plugin_id: String,
-    pub operation: String,
-    #[serde(default)]
-    pub payload: Value,
 }

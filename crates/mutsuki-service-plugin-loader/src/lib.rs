@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use mutsuki_runtime_contracts::{ArtifactType, PluginDeploymentKind, PluginManifest};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginLoaderError {
@@ -78,62 +76,29 @@ pub struct PluginRecord {
 #[derive(Clone, Default)]
 pub struct PluginCatalog {
     pub records: Vec<PluginRecord>,
-    pub host_plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
 
 #[derive(Clone, Default)]
 pub struct BuiltinRegistry {
     manifests: BTreeMap<String, PluginManifest>,
-    plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
 
 #[derive(Clone, Default)]
 pub struct BuiltinSelection {
     pub records: Vec<PluginRecord>,
-    pub host_plugins: BTreeMap<String, Arc<dyn HostPlugin>>,
 }
-
-/// Control-plane facade for host-linked plugins (not a parallel business runtime path).
-/// Callers must route through Core `HostContext`; plugins must not register capabilities at call time.
-pub trait HostPlugin: Send + Sync {
-    fn manifest(&self) -> &PluginManifest;
-    fn call(&self, operation: &str, payload: Value) -> HostPluginCallResult<Value>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum HostPluginCallError {
-    #[error("unsupported plugin operation: {0}")]
-    UnsupportedOperation(String),
-    #[error("bad plugin request: {0}")]
-    BadRequest(String),
-    #[error("plugin operation failed: {0}")]
-    Failed(String),
-}
-
-pub type HostPluginCallResult<T> = Result<T, HostPluginCallError>;
 
 impl BuiltinRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(&mut self, plugin: Arc<dyn HostPlugin>) {
-        self.manifests.insert(
-            plugin.manifest().plugin_id.clone(),
-            plugin.manifest().clone(),
-        );
-        self.plugins
-            .insert(plugin.manifest().plugin_id.clone(), plugin);
-    }
-
-    /// Registers a product-linked builtin that has no control-plane `HostPlugin` facade.
     pub fn register_manifest(&mut self, manifest: PluginManifest) {
         self.manifests.insert(manifest.plugin_id.clone(), manifest);
     }
 
     pub fn load_requested(&self, requested: &[String]) -> PluginLoaderResult<BuiltinSelection> {
         let mut records = Vec::new();
-        let mut host_plugins = BTreeMap::new();
         for plugin_id in requested {
             let Some(manifest) = self.manifests.get(plugin_id) else {
                 return Err(PluginLoaderError::BuiltinUnavailable(plugin_id.clone()));
@@ -145,14 +110,8 @@ impl BuiltinRegistry {
                 runtime: None,
                 enabled: true,
             });
-            if let Some(plugin) = self.plugins.get(plugin_id) {
-                host_plugins.insert(plugin_id.clone(), plugin.clone());
-            }
         }
-        Ok(BuiltinSelection {
-            records,
-            host_plugins,
-        })
+        Ok(BuiltinSelection { records })
     }
 }
 
@@ -200,10 +159,7 @@ impl PluginCatalog {
             }
         }
         records.sort_by(|a, b| a.manifest.plugin_id.cmp(&b.manifest.plugin_id));
-        Ok(Self {
-            records,
-            host_plugins: builtin.host_plugins,
-        })
+        Ok(Self { records })
     }
 
     pub fn external_records(&self) -> impl Iterator<Item = &PluginRecord> {
