@@ -214,6 +214,25 @@ pub struct ConfigOverrides {
 }
 
 impl ServiceConfig {
+    /// Resolves a named secret through the Host environment boundary.
+    ///
+    /// The returned value must remain inside product assembly and effectful
+    /// adapters; task payloads and ordinary configuration should only store
+    /// the key passed to this method.
+    pub fn secret(&self, key: &str) -> Option<String> {
+        let key = key
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        env::var(format!("{}{key}", self.security.secret_env_prefix)).ok()
+    }
+
     pub fn load(overrides: ConfigOverrides) -> ConfigResult<Self> {
         let mut config = Self::default();
         if let Some(home) = overrides.home_dir {
