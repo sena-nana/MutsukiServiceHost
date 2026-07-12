@@ -969,6 +969,11 @@ impl ServiceRuntimeInner {
         let drain_timeout = reload_drain_timeout(&self.config, &new_catalog);
         let plugin_count = new_catalog.records.len();
         let sidecars = sidecar_specs(&self.config, &new_catalog);
+        let runtime_lock_path = self.config.service.run_dir.join("runtime.lock.json");
+        let previous_runtime_lock = fs::read(&runtime_lock_path).ok();
+        if let Err(error) = write_runtime_lock(&self.config, &runtime_lock) {
+            return ControlResponse::err(ControlError::Failed(error.to_string()));
+        }
         let decision = {
             let mut guard = self.host_runtime.lock().expect("host runtime mutex");
             let Some(runtime) = guard.as_mut() else {
@@ -976,13 +981,17 @@ impl ServiceRuntimeInner {
             };
             match runtime.reload(prepared, drain_timeout) {
                 Ok(decision) => decision,
-                Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+                Err(error) => {
+                    let restore = restore_runtime_lock(&runtime_lock_path, previous_runtime_lock);
+                    return ControlResponse::err(ControlError::Failed(match restore {
+                        Ok(()) => error.to_string(),
+                        Err(restore_error) => {
+                            format!("{error}; restoring runtime lock failed: {restore_error}")
+                        }
+                    }));
+                }
             }
         };
-
-        if let Err(error) = write_runtime_lock(&self.config, &runtime_lock) {
-            return ControlResponse::err(ControlError::Failed(error.to_string()));
-        }
 
         *self.catalog.lock().expect("catalog mutex") = new_catalog;
         let runner_errors = reconcile_supervised_sidecars(
@@ -1464,6 +1473,14 @@ fn write_runtime_lock(
         path: path.display().to_string(),
         detail: error.to_string(),
     })
+}
+
+fn restore_runtime_lock(path: &std::path::Path, previous: Option<Vec<u8>>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => fs::write(path, bytes),
+        None if path.exists() => fs::remove_file(path),
+        None => Ok(()),
+    }
 }
 
 fn runtime_bootstrapper(
