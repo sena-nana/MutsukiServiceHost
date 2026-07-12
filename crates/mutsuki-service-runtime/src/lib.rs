@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
+use mutsuki_runtime_contracts::resource::experimental::{CommandBatch, SagaPlan};
 use mutsuki_runtime_contracts::{
-    CancelPolicy, PluginDeploymentKind, RuntimeProfile, RuntimeProfileMode, SurfaceCompatibility,
-    TaskBatch, TaskHandle, TaskOutcome, TaskStatus,
+    CancelPolicy, CommandPlan, ExportPlan, PlanReceipt, PluginDeploymentKind, ReadPlan,
+    RuntimeProfile, RuntimeProfileMode, SnapshotDescriptor, StreamPlan, SurfaceCompatibility,
+    TaskBatch, TaskHandle, TaskOutcome, TaskStatus, WritePlan,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 #[cfg(test)]
@@ -18,7 +20,9 @@ use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
     ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner,
 };
-use mutsuki_runtime_sdk::{RuntimeClient, RuntimeClientRef, TaskSubmitterRuntimeClient};
+use mutsuki_runtime_sdk::{
+    ResourcePlanGateway, RuntimeClient, RuntimeClientRef, TaskSubmitter, TaskSubmitterRuntimeClient,
+};
 #[cfg(test)]
 use mutsuki_service_config::ConfiguredPluginSelection;
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
@@ -39,6 +43,7 @@ use mutsuki_service_runner_supervisor::{
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 
+mod abi_plugin;
 mod event_source;
 
 use event_source::EventSourceSupervisor;
@@ -52,15 +57,35 @@ type NativeRunnerFactory = Arc<dyn Fn() -> Result<Box<dyn Runner>, String> + Sen
 type HealthProbe = Arc<dyn Fn() -> Value + Send + Sync>;
 
 #[derive(Default)]
-struct DeferredRuntimeClient(OnceLock<RuntimeClientRef>);
+struct DeferredRuntimeClient {
+    runtime: OnceLock<RuntimeClientRef>,
+    task_submitter: OnceLock<Arc<dyn TaskSubmitter>>,
+    resource_gateway: OnceLock<Arc<dyn ResourcePlanGateway>>,
+}
 
 impl DeferredRuntimeClient {
-    fn bind(&self, client: RuntimeClientRef) {
-        assert!(self.0.set(client).is_ok(), "runtime client already bound");
+    fn bind(
+        &self,
+        task_submitter: Arc<dyn TaskSubmitter>,
+        resource_gateway: Arc<dyn ResourcePlanGateway>,
+    ) {
+        let runtime = TaskSubmitterRuntimeClient::new(task_submitter.clone()).into_runtime_client();
+        assert!(
+            self.runtime.set(runtime).is_ok(),
+            "runtime client already bound"
+        );
+        assert!(
+            self.task_submitter.set(task_submitter).is_ok(),
+            "task submitter already bound"
+        );
+        assert!(
+            self.resource_gateway.set(resource_gateway).is_ok(),
+            "resource gateway already bound"
+        );
     }
 
     fn client(&self) -> RuntimeResult<RuntimeClientRef> {
-        self.0.get().cloned().ok_or_else(|| {
+        self.runtime.get().cloned().ok_or_else(|| {
             RuntimeFailure::new(mutsuki_runtime_contracts::RuntimeError::new(
                 mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
                 "mutsuki.service.runtime",
@@ -68,6 +93,28 @@ impl DeferredRuntimeClient {
             ))
         })
     }
+
+    fn task_submitter(&self) -> RuntimeResult<Arc<dyn TaskSubmitter>> {
+        self.task_submitter
+            .get()
+            .cloned()
+            .ok_or_else(deferred_not_bound)
+    }
+
+    fn resource_gateway(&self) -> RuntimeResult<Arc<dyn ResourcePlanGateway>> {
+        self.resource_gateway
+            .get()
+            .cloned()
+            .ok_or_else(deferred_not_bound)
+    }
+}
+
+fn deferred_not_bound() -> RuntimeFailure {
+    RuntimeFailure::new(mutsuki_runtime_contracts::RuntimeError::new(
+        mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+        "mutsuki.service.runtime",
+        "runtime_client.not_bound",
+    ))
 }
 
 impl RuntimeClient for DeferredRuntimeClient {
@@ -83,6 +130,60 @@ impl RuntimeClient for DeferredRuntimeClient {
         if let Ok(client) = self.client() {
             client.register_waker(handle, waker);
         }
+    }
+}
+
+impl TaskSubmitter for DeferredRuntimeClient {
+    fn submit_batch(&self, batch: TaskBatch) -> RuntimeResult<Vec<TaskHandle>> {
+        self.task_submitter()?.submit_batch(batch)
+    }
+
+    fn cancel_task(&self, handle: &TaskHandle) -> RuntimeResult<()> {
+        self.task_submitter()?.cancel_task(handle)
+    }
+
+    fn task_outcome(&self, handle: &TaskHandle) -> RuntimeResult<Option<TaskOutcome>> {
+        self.task_submitter()?.task_outcome(handle)
+    }
+}
+
+impl ResourcePlanGateway for DeferredRuntimeClient {
+    fn collect_read_plan(&self, plan: &ReadPlan) -> RuntimeResult<Vec<u8>> {
+        self.resource_gateway()?.collect_read_plan(plan)
+    }
+
+    fn snapshot_read_plan(
+        &self,
+        plan: &ReadPlan,
+        kind_id: &str,
+        schema: &str,
+    ) -> RuntimeResult<SnapshotDescriptor> {
+        self.resource_gateway()?
+            .snapshot_read_plan(plan, kind_id, schema)
+    }
+
+    fn open_stream_plan(&self, plan: &ReadPlan) -> RuntimeResult<StreamPlan> {
+        self.resource_gateway()?.open_stream_plan(plan)
+    }
+
+    fn execute_export_plan(&self, plan: &ExportPlan) -> RuntimeResult<PlanReceipt> {
+        self.resource_gateway()?.execute_export_plan(plan)
+    }
+
+    fn commit_write_plan(&self, plan: &WritePlan, bytes: Vec<u8>) -> RuntimeResult<PlanReceipt> {
+        self.resource_gateway()?.commit_write_plan(plan, bytes)
+    }
+
+    fn execute_command_plan(&self, plan: &CommandPlan) -> RuntimeResult<PlanReceipt> {
+        self.resource_gateway()?.execute_command_plan(plan)
+    }
+
+    fn execute_command_batch(&self, batch: &CommandBatch) -> RuntimeResult<Vec<PlanReceipt>> {
+        self.resource_gateway()?.execute_command_batch(batch)
+    }
+
+    fn execute_saga_plan(&self, saga: &SagaPlan) -> RuntimeResult<Vec<PlanReceipt>> {
+        self.resource_gateway()?.execute_saga_plan(saga)
     }
 }
 
@@ -114,6 +215,8 @@ pub enum ServiceRuntimeError {
     RawConfiguredPluginSecret { plugin_id: String, field: String },
     #[error("configured plugin {plugin_id} failed to install: {detail}")]
     ConfiguredPluginInstall { plugin_id: String, detail: String },
+    #[error("ABI plugin {plugin_id} failed to load: {detail}")]
+    AbiPlugin { plugin_id: String, detail: String },
 }
 
 pub type ServiceRuntimeResult<T> = Result<T, ServiceRuntimeError>;
@@ -194,6 +297,7 @@ struct ServiceRuntimeInner {
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
     health_probes: BTreeMap<String, HealthProbe>,
+    runtime_client: Arc<DeferredRuntimeClient>,
     shutdown_tx: Mutex<Option<oneshot::Sender<String>>>,
 }
 
@@ -313,10 +417,15 @@ impl ServiceRuntimeBuilder {
         let supervisor = RunnerSupervisor::new();
         let event_source_supervisor = EventSourceSupervisor::default();
         let catalog = load_catalog(&config, &builtin_registry)?;
-        let host_runtime = boot_core(&config, &catalog, &native_runner_factories)?;
+        let host_runtime = boot_core(
+            &config,
+            &catalog,
+            &native_runner_factories,
+            runtime_client.clone(),
+        )?;
         let task_submitter = host_runtime.host_context().task_submitter_ref();
-        runtime_client
-            .bind(TaskSubmitterRuntimeClient::new(task_submitter.clone()).into_runtime_client());
+        let resource_gateway = host_runtime.host_context().resource_gateway_ref();
+        runtime_client.bind(task_submitter.clone(), resource_gateway);
         start_supervised_sidecars(&config, &catalog, &supervisor).await;
 
         let inner = Arc::new(ServiceRuntimeInner {
@@ -329,6 +438,7 @@ impl ServiceRuntimeBuilder {
             builtin_registry,
             native_runner_factories,
             health_probes,
+            runtime_client,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
         let core_pump = spawn_core_pump(Arc::downgrade(&inner), core_pump_rx);
@@ -662,14 +772,18 @@ impl ServiceRuntimeInner {
             runtime.host_context().registry_generation()
         };
         let registry_generation = previous_generation.saturating_add(1);
-        let prepared =
-            match runtime_bootstrapper(&self.config, &new_catalog, &self.native_runner_factories)
-                .and_then(|(bootstrapper, profile)| {
-                    Ok(bootstrapper.prepare_reload(profile, registry_generation)?)
-                }) {
-                Ok(reload) => reload,
-                Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
-            };
+        let prepared = match runtime_bootstrapper(
+            &self.config,
+            &new_catalog,
+            &self.native_runner_factories,
+            self.runtime_client.clone(),
+        )
+        .and_then(|(bootstrapper, profile)| {
+            Ok(bootstrapper.prepare_reload(profile, registry_generation)?)
+        }) {
+            Ok(reload) => reload,
+            Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+        };
         let drain_timeout = reload_drain_timeout(&self.config, &new_catalog);
         let plugin_count = new_catalog.records.len();
         let sidecars = sidecar_specs(&self.config, &new_catalog);
@@ -948,8 +1062,10 @@ fn boot_core(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<HostRuntime> {
-    let (bootstrapper, profile) = runtime_bootstrapper(config, catalog, native_runner_factories)?;
+    let (bootstrapper, profile) =
+        runtime_bootstrapper(config, catalog, native_runner_factories, runtime_client)?;
     let host_config = HostRuntimeConfig {
         worker_threads: config.core.worker_threads,
         blocking_threads: config.core.blocking_threads,
@@ -962,6 +1078,7 @@ fn runtime_bootstrapper(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<(RuntimeBootstrapper, RuntimeProfile)> {
     let mut bootstrapper = RuntimeBootstrapper::new();
     let mut enabled_plugins = Vec::new();
@@ -979,7 +1096,18 @@ fn runtime_bootstrapper(
             PluginDeploymentKind::default_for_artifact(&record.manifest.artifact.artifact_type);
         deployments.insert(record.manifest.plugin_id.clone(), deployment.clone());
         enabled_plugins.push(record.manifest.plugin_id.clone());
-        bootstrapper.register_manifest(record.manifest.clone());
+        if matches!(
+            record.manifest.artifact.artifact_type,
+            mutsuki_runtime_contracts::ArtifactType::Abi
+        ) {
+            bootstrapper.register_loaded_plugin(abi_plugin::load_abi_plugin(
+                record,
+                config,
+                runtime_client.clone(),
+            )?);
+        } else {
+            bootstrapper.register_manifest(record.manifest.clone());
+        }
 
         if let Some(runtime) = &record.runtime {
             register_stdio_runners(config, &mut bootstrapper, record, runtime, deployment)?;
@@ -1768,8 +1896,12 @@ mod tests {
         let inner = test_started_runtime_inner("token", dir.path());
         let plugin_dir = dir.path().join("installed").join("dynamic");
         std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        let mut manifest = minimal_manifest("mutsuki.dynamic.test");
+        manifest.artifact.artifact_type = ArtifactType::Process;
+        manifest.artifact.path = "dynamic-test".into();
+        manifest.artifact.sha256 = "sha256:dynamic-test".into();
         let plugin = mutsuki_service_plugin_loader::PluginToml {
-            manifest: minimal_manifest("mutsuki.dynamic.test"),
+            manifest,
             runtime: None,
             enabled: Some(true),
         };
@@ -2273,7 +2405,8 @@ mod tests {
         config.plugins.disabled_dir = root.join("disabled");
         let registry = test_builtin_registry();
         let catalog = load_catalog(&config, &registry).expect("catalog");
-        let host_runtime = boot_core(&config, &catalog, &[]).expect("core");
+        let runtime_client = Arc::new(DeferredRuntimeClient::default());
+        let host_runtime = boot_core(&config, &catalog, &[], runtime_client.clone()).expect("core");
         ServiceRuntimeInner {
             config,
             started_at: Instant::now(),
@@ -2284,6 +2417,7 @@ mod tests {
             builtin_registry: registry,
             native_runner_factories: Vec::new(),
             health_probes: BTreeMap::new(),
+            runtime_client,
             shutdown_tx: Mutex::new(None),
         }
     }

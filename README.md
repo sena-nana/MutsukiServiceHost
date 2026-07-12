@@ -81,6 +81,18 @@ runner_link = "jsonl-stdio"
 and registered with Core as external runners (`runner.run_batch`). Sidecar processes without Core
 runner descriptors are supervised by the runner supervisor and exposed through the control API.
 
+ABI plugins use the same Core JSONL runner/task/resource methods through the versioned byte
+transport exported by `mutsuki-runtime-sdk`. An installed package contains `plugin.toml` and one
+platform library (`.dll`, `.so`, or `.dylib`) referenced by `manifest.artifact.path`. The path must
+remain inside the package directory and `manifest.artifact.sha256` must contain the exact lowercase
+`sha256:<hex>` digest. ServiceHost verifies the artifact, stages it under
+`<run>/abi/<plugin-id>/<sha256>/`, performs the Core ABI handshake, and only then registers its
+Runner and ResourceProvider surfaces. A `native` artifact found in a dynamic directory is rejected;
+native plugins must be linked into the product's configured factory catalog.
+
+ABI libraries are trusted in-process code, not a sandbox boundary. Plugins that require crash or
+security isolation should use the process/Python deployment instead.
+
 ServiceHost does not link development, conversation, or UI plugins. Product binaries may register
 real builtin crates through `ServiceRuntimeBuilder`; missing upstream capabilities remain unavailable.
 
