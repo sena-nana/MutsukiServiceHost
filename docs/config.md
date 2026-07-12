@@ -27,6 +27,10 @@ Important directories:
 - `plugins`
 - `run`
 
+Each top-level section may be partial. Omitted fields inherit the section defaults, so product
+templates can expose only the settings their users are expected to change while ServiceHost
+continues to own advanced runtime defaults.
+
 If no control token is provided through config, `MUTSUKI_CONTROL_TOKEN`, or CLI `--token`, ServiceHost creates `<home>/run/control.token` and reuses it for local clients.
 # Configured native plugins
 

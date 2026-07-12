@@ -88,6 +88,7 @@ impl SecretStore {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServiceSection {
     pub profile: String,
     pub instance_id: String,
@@ -114,6 +115,7 @@ impl Default for ServiceSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CoreSection {
     pub max_tasks: usize,
     pub shutdown_timeout_ms: u64,
@@ -135,6 +137,7 @@ impl Default for CoreSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IpcSection {
     pub enabled: bool,
     pub transport: IpcTransport,
@@ -170,6 +173,7 @@ impl Default for IpcTransport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PluginsSection {
     pub builtin: Vec<String>,
     #[serde(default)]
@@ -205,6 +209,7 @@ impl Default for PluginsSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunnersSection {
     pub restart: bool,
     pub max_restart_per_minute: u32,
@@ -224,6 +229,7 @@ impl Default for RunnersSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ObserveSection {
     pub console: bool,
     pub json: bool,
@@ -677,6 +683,54 @@ mod tests {
             }),
             Err(ConfigError::ReadSecretFile { .. })
         ));
+    }
+
+    #[test]
+    fn partial_sections_keep_host_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("simple.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[service]
+profile = "simple"
+home_dir = "{}"
+
+[ipc]
+enabled = false
+
+[plugins]
+dynamic_dirs = []
+
+[observe]
+json = true
+"#,
+                root.path()
+                    .join("home")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let config = ServiceConfig::load(ConfigOverrides {
+            config_file: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.service.profile, "simple");
+        assert_eq!(config.service.instance_id, "default");
+        assert_eq!(config.service.home_dir, root.path().join("home"));
+        assert_eq!(
+            config.service.data_dir,
+            config.service.home_dir.join("data")
+        );
+        assert!(!config.ipc.enabled);
+        assert_eq!(config.ipc.name, "mutsuki-service-default");
+        assert!(config.plugins.dynamic_dirs.is_empty());
+        assert!(config.observe.json);
+        assert_eq!(config.observe.log_file, "service.log");
     }
 
     #[test]
