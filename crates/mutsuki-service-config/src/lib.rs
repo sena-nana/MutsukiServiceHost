@@ -173,9 +173,8 @@ impl Default for IpcTransport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PluginsSection {
-    pub builtin: Vec<String>,
     #[serde(default)]
     pub configured: Vec<ConfiguredPluginSelection>,
     pub dynamic_dirs: Vec<PathBuf>,
@@ -200,7 +199,6 @@ impl Default for PluginsSection {
     fn default() -> Self {
         let home = default_home_dir();
         Self {
-            builtin: Vec::new(),
             configured: Vec::new(),
             dynamic_dirs: vec![home.join("plugins").join("installed")],
             disabled_dir: home.join("plugins").join("disabled"),
@@ -731,6 +729,18 @@ json = true
         assert!(config.plugins.dynamic_dirs.is_empty());
         assert!(config.observe.json);
         assert_eq!(config.observe.log_file, "service.log");
+    }
+
+    #[test]
+    fn legacy_builtin_plugin_selection_is_rejected() {
+        let error = toml::from_str::<PluginsSection>(
+            r#"builtin = ["legacy.plugin"]
+dynamic_dirs = []
+disabled_dir = "disabled"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `builtin`"));
     }
 
     #[test]

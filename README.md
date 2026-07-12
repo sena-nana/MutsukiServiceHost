@@ -47,6 +47,8 @@ In another shell:
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token status
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token health
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin list
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin set owner.plugin.id abi
+cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token plugin clear owner.plugin.id
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token event-source list
 cargo run -p mutsuki-service-host -- --home .mutsuki-dev --token dev-token stop
 ```
@@ -67,7 +69,9 @@ the token is stored in `<home>/run/control.token` and is not written into the se
 
 ## Plugin Runtime
 
-Dynamic plugins are discovered from `plugins/installed/**/plugin.toml`. A plugin manifest maps directly to the Mutsuki runtime contracts `PluginManifest`. External process plugins add a `[runtime]` section:
+Dynamic plugins are inventoried from `plugins/installed/**/plugin.toml`, but only IDs selected by
+`[[plugins.configured]]` enter the RuntimeLoadPlan. A plugin manifest maps directly to the Mutsuki
+runtime contracts `PluginManifest`. External process plugins add a `[runtime]` section:
 
 ```toml
 [runtime]
@@ -86,9 +90,16 @@ transport exported by `mutsuki-runtime-sdk`. An installed package contains `plug
 platform library (`.dll`, `.so`, or `.dylib`) referenced by `manifest.artifact.path`. The path must
 remain inside the package directory and `manifest.artifact.sha256` must contain the exact lowercase
 `sha256:<hex>` digest. ServiceHost verifies the artifact, stages it under
-`<run>/abi/<plugin-id>/<sha256>/`, performs the Core ABI handshake, and only then registers its
+`<run>/abi/<plugin-id>/<sha256>/`, sends the same owner-defined config through the mandatory Core
+ABI v2 `plugin.initialize` request, and only then registers its
 Runner and ResourceProvider surfaces. A `native` artifact found in a dynamic directory is rejected;
 native plugins must be linked into the product's configured factory catalog.
+
+When builtin and ABI are both available, builtin is the deterministic default. Authenticated Host
+management may switch deployment without changing business config; the preference is persisted in
+`<data>/plugin-deployments.json`, while the exact resolved artifacts are written to
+`<run>/runtime.lock.json`. Invalid unselected artifacts remain visible as inventory diagnostics and
+do not prevent unrelated configured plugins from starting.
 
 ABI libraries are trusted in-process code, not a sandbox boundary. Plugins that require crash or
 security isolation should use the process/Python deployment instead.

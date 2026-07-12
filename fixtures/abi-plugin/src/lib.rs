@@ -120,7 +120,19 @@ pub fn fixture_manifest(path: &str, sha256: &str) -> PluginManifest {
     build_plugin(path, sha256).manifest
 }
 
-fn create_plugin(_host: AbiHostClient) -> RuntimeResult<mutsuki_runtime_sdk::LoadedPlugin> {
+fn create_plugin(
+    _host: AbiHostClient,
+    config: Value,
+) -> RuntimeResult<mutsuki_runtime_sdk::LoadedPlugin> {
+    if config.get("fixture").and_then(Value::as_bool) != Some(true) {
+        return Err(RuntimeFailure::new(
+            mutsuki_runtime_contracts::RuntimeError::new(
+                mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+                PLUGIN_ID,
+                "fixture.config_required",
+            ),
+        ));
+    }
     Ok(build_plugin("fixture", "sha256:fixture"))
 }
 

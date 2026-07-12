@@ -68,12 +68,11 @@ pub enum PluginLoaderError {
 pub type PluginLoaderResult<T> = Result<T, PluginLoaderError>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginToml {
     pub manifest: PluginManifest,
     #[serde(default)]
     pub runtime: Option<ExternalRuntimeSpec>,
-    #[serde(default)]
-    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,13 +93,49 @@ pub struct PluginRecord {
     pub manifest_path: PathBuf,
     pub manifest: PluginManifest,
     pub runtime: Option<ExternalRuntimeSpec>,
-    pub enabled: bool,
     pub resolved_artifact: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
-pub struct PluginCatalog {
+pub struct PluginInventory {
     pub records: Vec<PluginRecord>,
+    pub diagnostics: Vec<PluginDiagnostic>,
+}
+
+#[derive(Clone, Default)]
+pub struct PluginCatalog {
+    /// Artifacts selected by the business configuration and Host deployment resolver.
+    pub records: Vec<PluginRecord>,
+    /// Every valid artifact discovered for management inventory.
+    pub candidates: Vec<PluginRecord>,
+    pub diagnostics: Vec<PluginDiagnostic>,
+}
+
+impl PluginCatalog {
+    pub fn resolved(inventory: PluginInventory, records: Vec<PluginRecord>) -> Self {
+        Self {
+            records,
+            candidates: inventory.records,
+            diagnostics: inventory.diagnostics,
+        }
+    }
+
+    pub fn external_records(&self) -> impl Iterator<Item = &PluginRecord> {
+        self.records.iter().filter(|record| {
+            matches!(
+                record.manifest.artifact.artifact_type,
+                ArtifactType::Process | ArtifactType::Python
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginDiagnostic {
+    pub manifest_path: PathBuf,
+    pub plugin_id: Option<String>,
+    pub deployment: Option<PluginDeploymentKind>,
+    pub detail: String,
 }
 
 #[derive(Clone, Default)]
@@ -122,18 +157,14 @@ impl BuiltinRegistry {
         self.manifests.insert(manifest.plugin_id.clone(), manifest);
     }
 
-    pub fn load_requested(&self, requested: &[String]) -> PluginLoaderResult<BuiltinSelection> {
+    pub fn load_all(&self) -> PluginLoaderResult<BuiltinSelection> {
         let mut records = Vec::new();
-        for plugin_id in requested {
-            let Some(manifest) = self.manifests.get(plugin_id) else {
-                return Err(PluginLoaderError::BuiltinUnavailable(plugin_id.clone()));
-            };
+        for manifest in self.manifests.values() {
             validate_manifest(manifest, None)?;
             records.push(PluginRecord {
                 manifest_path: PathBuf::from("<builtin>"),
                 manifest: manifest.clone(),
                 runtime: None,
-                enabled: true,
                 resolved_artifact: None,
             });
         }
@@ -141,13 +172,14 @@ impl BuiltinRegistry {
     }
 }
 
-impl PluginCatalog {
+impl PluginInventory {
     pub fn scan(
         dynamic_dirs: &[PathBuf],
         disabled_dir: &Path,
         builtin: BuiltinSelection,
     ) -> PluginLoaderResult<Self> {
         let mut records = builtin.records;
+        let mut diagnostics = Vec::new();
         let disabled_plugins = disabled_plugins(disabled_dir);
         for dir in dynamic_dirs {
             if !dir.exists() {
@@ -172,18 +204,63 @@ impl PluginCatalog {
                 {
                     continue;
                 }
-                let record = read_plugin_manifest(&manifest_path)?;
-                let enabled = record.enabled.unwrap_or(true)
-                    && !disabled_plugins.contains(&record.manifest.plugin_id);
-                validate_manifest(&record.manifest, record.runtime.as_ref())?;
+                let record = match read_plugin_manifest(&manifest_path) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        diagnostics.push(PluginDiagnostic {
+                            manifest_path,
+                            plugin_id: None,
+                            deployment: None,
+                            detail: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let plugin_id = record.manifest.plugin_id.clone();
+                let deployment = PluginDeploymentKind::default_for_artifact(
+                    &record.manifest.artifact.artifact_type,
+                );
+                if disabled_plugins.contains(&plugin_id) {
+                    diagnostics.push(PluginDiagnostic {
+                        manifest_path,
+                        plugin_id: Some(plugin_id),
+                        deployment: Some(deployment),
+                        detail: "artifact is quarantined by the Host".into(),
+                    });
+                    continue;
+                }
+                if let Err(error) = validate_manifest(&record.manifest, record.runtime.as_ref()) {
+                    diagnostics.push(PluginDiagnostic {
+                        manifest_path,
+                        plugin_id: Some(plugin_id),
+                        deployment: Some(deployment),
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
                 if matches!(record.manifest.artifact.artifact_type, ArtifactType::Native) {
-                    return Err(PluginLoaderError::DynamicNative(
-                        record.manifest.plugin_id.clone(),
-                    ));
+                    diagnostics.push(PluginDiagnostic {
+                        manifest_path,
+                        plugin_id: Some(plugin_id.clone()),
+                        deployment: Some(deployment),
+                        detail: PluginLoaderError::DynamicNative(plugin_id).to_string(),
+                    });
+                    continue;
                 }
                 let resolved_artifact =
                     if matches!(record.manifest.artifact.artifact_type, ArtifactType::Abi) {
-                        Some(validate_abi_artifact(&manifest_path, &record.manifest)?)
+                        match validate_abi_artifact(&manifest_path, &record.manifest) {
+                            Ok(path) => Some(path),
+                            Err(error) => {
+                                diagnostics.push(PluginDiagnostic {
+                                    manifest_path,
+                                    plugin_id: Some(plugin_id),
+                                    deployment: Some(deployment),
+                                    detail: error.to_string(),
+                                });
+                                continue;
+                            }
+                        }
                     } else {
                         None
                     };
@@ -191,31 +268,52 @@ impl PluginCatalog {
                     manifest_path,
                     manifest: record.manifest,
                     runtime: record.runtime,
-                    enabled,
                     resolved_artifact,
                 });
             }
         }
-        records.sort_by(|a, b| a.manifest.plugin_id.cmp(&b.manifest.plugin_id));
-        for pair in records.windows(2) {
-            if pair[0].manifest.plugin_id == pair[1].manifest.plugin_id {
-                return Err(PluginLoaderError::DuplicatePlugin(
-                    pair[0].manifest.plugin_id.clone(),
-                ));
+        records.sort_by(|a, b| {
+            candidate_key(a)
+                .cmp(&candidate_key(b))
+                .then_with(|| a.manifest_path.cmp(&b.manifest_path))
+        });
+        let mut unique = Vec::new();
+        for group in records.chunk_by(|a, b| candidate_key(a) == candidate_key(b)) {
+            if group.len() == 1 {
+                unique.push(group[0].clone());
+            } else {
+                let first = &group[0];
+                diagnostics.push(PluginDiagnostic {
+                    manifest_path: first.manifest_path.clone(),
+                    plugin_id: Some(first.manifest.plugin_id.clone()),
+                    deployment: Some(PluginDeploymentKind::default_for_artifact(
+                        &first.manifest.artifact.artifact_type,
+                    )),
+                    detail: format!(
+                        "multiple {:?} artifacts are installed for plugin {}",
+                        PluginDeploymentKind::default_for_artifact(
+                            &first.manifest.artifact.artifact_type
+                        ),
+                        first.manifest.plugin_id
+                    ),
+                });
             }
         }
-        Ok(Self { records })
-    }
-
-    pub fn external_records(&self) -> impl Iterator<Item = &PluginRecord> {
-        self.records.iter().filter(|record| {
-            record.enabled
-                && matches!(
-                    record.manifest.artifact.artifact_type,
-                    ArtifactType::Process | ArtifactType::Python
-                )
+        Ok(Self {
+            records: unique,
+            diagnostics,
         })
     }
+}
+
+fn candidate_key(record: &PluginRecord) -> (String, String) {
+    (
+        record.manifest.plugin_id.clone(),
+        format!(
+            "{:?}",
+            PluginDeploymentKind::default_for_artifact(&record.manifest.artifact.artifact_type)
+        ),
+    )
 }
 
 fn validate_abi_artifact(
@@ -385,7 +483,7 @@ mod tests {
             ),
         );
 
-        let catalog = PluginCatalog::scan(
+        let catalog = PluginInventory::scan(
             &[root.path().join("installed")],
             &root.path().join("disabled"),
             BuiltinSelection::default(),
@@ -400,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_rejects_hash_mismatch_and_dynamic_native() {
+    fn scan_reports_hash_mismatch_and_dynamic_native_as_unavailable_inventory() {
         let root = tempdir().unwrap();
         let installed = root.path().join("installed");
         let abi_dir = installed.join("abi-test");
@@ -416,14 +514,14 @@ mod tests {
                 &format!("sha256:{}", "0".repeat(64)),
             ),
         );
-        assert!(matches!(
-            PluginCatalog::scan(
-                std::slice::from_ref(&installed),
-                &root.path().join("disabled"),
-                BuiltinSelection::default(),
-            ),
-            Err(PluginLoaderError::ArtifactHashMismatch { .. })
-        ));
+        let inventory = PluginInventory::scan(
+            std::slice::from_ref(&installed),
+            &root.path().join("disabled"),
+            BuiltinSelection::default(),
+        )
+        .unwrap();
+        assert!(inventory.records.is_empty());
+        assert!(inventory.diagnostics[0].detail.contains("hash mismatch"));
 
         fs::remove_dir_all(&abi_dir).unwrap();
         let native_dir = installed.join("native-test");
@@ -437,14 +535,42 @@ mod tests {
                 "sha256:native",
             ),
         );
-        assert!(matches!(
-            PluginCatalog::scan(
-                &[installed],
-                &root.path().join("disabled"),
-                BuiltinSelection::default(),
-            ),
-            Err(PluginLoaderError::DynamicNative(id)) if id == "test.native"
-        ));
+        let inventory = PluginInventory::scan(
+            &[installed],
+            &root.path().join("disabled"),
+            BuiltinSelection::default(),
+        )
+        .unwrap();
+        assert!(inventory.records.is_empty());
+        assert!(
+            inventory.diagnostics[0]
+                .detail
+                .contains("not linked into this build")
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_enabled_field_is_rejected_as_inventory_diagnostic() {
+        let root = tempdir().unwrap();
+        let plugin_dir = root.path().join("installed").join("legacy");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.toml"),
+            "enabled = true\n[manifest]\nplugin_id = \"legacy\"",
+        )
+        .unwrap();
+        let inventory = PluginInventory::scan(
+            &[root.path().join("installed")],
+            &root.path().join("disabled"),
+            BuiltinSelection::default(),
+        )
+        .unwrap();
+        assert!(inventory.records.is_empty());
+        assert!(
+            inventory.diagnostics[0]
+                .detail
+                .contains("unknown field `enabled`")
+        );
     }
 
     fn write_plugin(dir: &Path, manifest: PluginManifest) {
@@ -453,7 +579,6 @@ mod tests {
             toml::to_string(&PluginToml {
                 manifest,
                 runtime: None,
-                enabled: Some(true),
             })
             .unwrap(),
         )

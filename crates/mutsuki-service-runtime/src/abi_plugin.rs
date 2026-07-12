@@ -105,6 +105,7 @@ pub(crate) fn load_abi_plugin(
     record: &PluginRecord,
     config: &ServiceConfig,
     runtime: Arc<DeferredRuntimeClient>,
+    plugin_config: Value,
 ) -> ServiceRuntimeResult<LoadedPlugin> {
     let source =
         record
@@ -166,10 +167,9 @@ pub(crate) fn load_abi_plugin(
         request_lock: Mutex::new(()),
         next_request: AtomicU64::new(0),
     });
-    let handshake: AbiHandshake = serde_json::from_value(connection.request(
-        "plugin.handshake",
-        json!({ "transport_version": ABI_TRANSPORT_VERSION }),
-    )?)
+    let handshake: AbiHandshake = serde_json::from_value(
+        connection.request("plugin.initialize", json!({ "config": plugin_config }))?,
+    )
     .map_err(|error| ServiceRuntimeError::AbiPlugin {
         plugin_id: record.manifest.plugin_id.clone(),
         detail: format!("invalid handshake: {error}"),
@@ -392,12 +392,16 @@ mod tests {
             manifest_path: root.path().join("plugin.toml"),
             manifest: manifest.clone(),
             runtime: None,
-            enabled: true,
             resolved_artifact: Some(artifact),
         };
 
-        let plugin =
-            load_abi_plugin(&record, &config, Arc::new(DeferredRuntimeClient::default())).unwrap();
+        let plugin = load_abi_plugin(
+            &record,
+            &config,
+            Arc::new(DeferredRuntimeClient::default()),
+            json!({"fixture": true}),
+        )
+        .unwrap();
         assert_eq!(plugin.runners.len(), 1);
         assert_eq!(plugin.resource_providers.len(), 1);
         let provider: &dyn ResourceProviderGateway = plugin.resource_providers[0].provider.as_ref();

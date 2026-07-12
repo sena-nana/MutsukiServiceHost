@@ -27,6 +27,8 @@ pub enum ControlMethod {
     CoreStatus,
     PluginList,
     PluginReload,
+    PluginDeploymentSet,
+    PluginDeploymentClear,
     RunnerList,
     RunnerRestart,
     RunnerStop,
@@ -123,13 +125,50 @@ pub struct CoreStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginListResponse {
+    pub plugins: Vec<PluginStatus>,
+    pub diagnostics: Vec<PluginInventoryDiagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginStatus {
     pub plugin_id: String,
+    pub configured: bool,
+    pub active_deployment: Option<String>,
+    pub preferred_deployment: Option<String>,
+    pub candidates: Vec<PluginCandidateStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginCandidateStatus {
+    pub deployment: String,
     pub version: String,
     pub api_version: String,
-    pub deployment: String,
-    pub enabled: bool,
+    pub sha256: String,
+    pub path: String,
+    pub available: bool,
     pub runner_link: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginInventoryDiagnostic {
+    pub manifest_path: String,
+    pub plugin_id: Option<String>,
+    pub deployment: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginDeploymentParam {
+    pub plugin_id: String,
+    pub deployment: mutsuki_runtime_contracts::PluginDeploymentKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginDeploymentClearParam {
+    pub plugin_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

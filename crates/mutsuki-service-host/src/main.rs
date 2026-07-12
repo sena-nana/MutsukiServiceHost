@@ -46,6 +46,8 @@ enum Command {
 enum PluginCommand {
     List,
     Reload,
+    Set { id: String, deployment: String },
+    Clear { id: String },
 }
 
 #[derive(Subcommand)]
@@ -126,6 +128,23 @@ async fn main() -> anyhow::Result<()> {
             PluginCommand::Reload => {
                 request_and_print(&config, ControlMethod::PluginReload, Value::Null).await?
             }
+            PluginCommand::Set { id, deployment } => {
+                let deployment = parse_deployment(&deployment)?;
+                request_and_print(
+                    &config,
+                    ControlMethod::PluginDeploymentSet,
+                    json!({ "plugin_id": id, "deployment": deployment }),
+                )
+                .await?
+            }
+            PluginCommand::Clear { id } => {
+                request_and_print(
+                    &config,
+                    ControlMethod::PluginDeploymentClear,
+                    json!({ "plugin_id": id }),
+                )
+                .await?
+            }
         },
         Command::Runner(command) => match command {
             RunnerCommand::List => {
@@ -184,6 +203,20 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+fn parse_deployment(
+    value: &str,
+) -> anyhow::Result<mutsuki_runtime_contracts::PluginDeploymentKind> {
+    use mutsuki_runtime_contracts::PluginDeploymentKind;
+    match value.to_ascii_lowercase().as_str() {
+        "builtin" => Ok(PluginDeploymentKind::Builtin),
+        "abi" => Ok(PluginDeploymentKind::Abi),
+        "wasm" => Ok(PluginDeploymentKind::Wasm),
+        "process" => Ok(PluginDeploymentKind::Process),
+        "python" => Ok(PluginDeploymentKind::Python),
+        _ => anyhow::bail!("unsupported plugin deployment {value}"),
+    }
 }
 
 fn print_daemon_action(action: &str, config: &ServiceConfig) {

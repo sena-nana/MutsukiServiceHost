@@ -1,5 +1,3 @@
-enabled = true
-
 [manifest]
 plugin_id = "example.external.runner"
 version = "0.1.0"

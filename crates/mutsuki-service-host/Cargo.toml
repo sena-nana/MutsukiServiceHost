@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+mutsuki-runtime-contracts.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-control.workspace = true
 mutsuki-service-daemon.workspace = true

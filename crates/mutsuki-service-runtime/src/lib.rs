@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::future::Future;
 #[cfg(test)]
 use std::io::Write;
@@ -18,7 +19,7 @@ use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
-    ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner,
+    ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner, resolve_load_plan,
 };
 use mutsuki_runtime_sdk::{
     ResourcePlanGateway, RuntimeClient, RuntimeClientRef, TaskSubmitter, TaskSubmitterRuntimeClient,
@@ -29,17 +30,21 @@ use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
-    PluginReloadChange, PluginReloadResponse, PluginStatus, RunnerStatus as ControlRunnerStatus,
-    ServiceStatus, TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
+    PluginCandidateStatus, PluginDeploymentClearParam, PluginDeploymentParam,
+    PluginInventoryDiagnostic, PluginListResponse, PluginReloadChange, PluginReloadResponse,
+    PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus,
+    TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
     TaskSnapshot as ControlTaskSnapshot,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
-    BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginLoaderError, PluginRecord,
+    BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginInventory, PluginLoaderError,
+    PluginRecord,
 };
 use mutsuki_service_runner_supervisor::{
     ManagedRunnerSpec, RunnerProcessState, RunnerSnapshot, RunnerSupervisor,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 
@@ -55,6 +60,27 @@ pub use event_source::{
 
 type NativeRunnerFactory = Arc<dyn Fn() -> Result<Box<dyn Runner>, String> + Send + Sync>;
 type HealthProbe = Arc<dyn Fn() -> Value + Send + Sync>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PluginDeploymentState {
+    #[serde(default = "deployment_state_version")]
+    version: u32,
+    #[serde(default)]
+    plugins: BTreeMap<String, PluginDeploymentKind>,
+}
+
+impl Default for PluginDeploymentState {
+    fn default() -> Self {
+        Self {
+            version: deployment_state_version(),
+            plugins: BTreeMap::new(),
+        }
+    }
+}
+
+fn deployment_state_version() -> u32 {
+    1
+}
 
 #[derive(Default)]
 struct DeferredRuntimeClient {
@@ -217,6 +243,22 @@ pub enum ServiceRuntimeError {
     ConfiguredPluginInstall { plugin_id: String, detail: String },
     #[error("ABI plugin {plugin_id} failed to load: {detail}")]
     AbiPlugin { plugin_id: String, detail: String },
+    #[error("configured plugin {plugin_id} has no available artifact: {detail}")]
+    PluginUnavailable { plugin_id: String, detail: String },
+    #[error("configured plugin {plugin_id} has multiple deployments and requires a Host selection")]
+    PluginDeploymentAmbiguous { plugin_id: String },
+    #[error("configured plugin {plugin_id} deployment {deployment:?} is unavailable: {detail}")]
+    PluginDeploymentUnavailable {
+        plugin_id: String,
+        deployment: PluginDeploymentKind,
+        detail: String,
+    },
+    #[error(
+        "plugin {plugin_id} builtin and selected deployment expose different business surfaces"
+    )]
+    PluginBusinessSurfaceMismatch { plugin_id: String },
+    #[error("failed to read or write plugin deployment state {path}: {detail}")]
+    PluginDeploymentState { path: String, detail: String },
 }
 
 pub type ServiceRuntimeResult<T> = Result<T, ServiceRuntimeError>;
@@ -248,7 +290,7 @@ pub struct ServiceRuntimeBuilder {
 pub trait ConfiguredPluginFactory: Send + Sync {
     fn plugin_id(&self) -> &str;
 
-    fn install(
+    fn prepare(
         &self,
         config: &Value,
         builder: ServiceRuntimeBuilder,
@@ -298,6 +340,7 @@ struct ServiceRuntimeInner {
     native_runner_factories: Vec<NativeRunnerFactory>,
     health_probes: BTreeMap<String, HealthProbe>,
     runtime_client: Arc<DeferredRuntimeClient>,
+    deployment_state: Mutex<PluginDeploymentState>,
     shutdown_tx: Mutex<Option<oneshot::Sender<String>>>,
 }
 
@@ -343,9 +386,6 @@ impl ServiceRuntimeBuilder {
         mut self,
         manifest: mutsuki_runtime_contracts::PluginManifest,
     ) -> Self {
-        if !self.config.plugins.builtin.contains(&manifest.plugin_id) {
-            self.config.plugins.builtin.push(manifest.plugin_id.clone());
-        }
         self.builtin_registry.register_manifest(manifest);
         self
     }
@@ -416,7 +456,8 @@ impl ServiceRuntimeBuilder {
         let (core_pump_shutdown, core_pump_rx) = watch::channel(false);
         let supervisor = RunnerSupervisor::new();
         let event_source_supervisor = EventSourceSupervisor::default();
-        let catalog = load_catalog(&config, &builtin_registry)?;
+        let deployment_state = load_deployment_state(&config)?;
+        let catalog = load_catalog_with_state(&config, &builtin_registry, &deployment_state)?;
         let host_runtime = boot_core(
             &config,
             &catalog,
@@ -439,6 +480,7 @@ impl ServiceRuntimeBuilder {
             native_runner_factories,
             health_probes,
             runtime_client,
+            deployment_state: Mutex::new(deployment_state),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
         let core_pump = spawn_core_pump(Arc::downgrade(&inner), core_pump_rx);
@@ -490,15 +532,13 @@ impl ServiceRuntimeBuilder {
                     field,
                 });
             }
-            let factory = self
-                .configured_plugins
-                .factory(plugin_id)
-                .ok_or_else(|| ServiceRuntimeError::UnknownConfiguredPlugin(plugin_id.into()))?;
-            resolved.push((selection, factory));
+            if let Some(factory) = self.configured_plugins.factory(plugin_id) {
+                resolved.push((selection, factory));
+            }
         }
         for (selection, factory) in resolved {
             let plugin_id = selection.id.clone();
-            self = factory.install(&selection.config, self).map_err(|detail| {
+            self = factory.prepare(&selection.config, self).map_err(|detail| {
                 ServiceRuntimeError::ConfiguredPluginInstall { plugin_id, detail }
             })?;
         }
@@ -681,6 +721,10 @@ impl ServiceRuntimeInner {
             ControlMethod::CoreStatus => self.core_status(),
             ControlMethod::PluginList => self.plugin_list(),
             ControlMethod::PluginReload => self.plugin_reload().await,
+            ControlMethod::PluginDeploymentSet => self.plugin_deployment_set(request.params).await,
+            ControlMethod::PluginDeploymentClear => {
+                self.plugin_deployment_clear(request.params).await
+            }
             ControlMethod::RunnerList => self.runner_list().await,
             ControlMethod::RunnerRestart => self.runner_restart(request.params).await,
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
@@ -735,35 +779,161 @@ impl ServiceRuntimeInner {
 
     fn plugin_list(&self) -> ControlResponse {
         let catalog = self.catalog.lock().expect("catalog mutex");
-        let plugins = catalog
-            .records
+        let state = self
+            .deployment_state
+            .lock()
+            .expect("deployment state mutex");
+        let mut plugin_ids = self
+            .config
+            .plugins
+            .configured
             .iter()
-            .map(|record| PluginStatus {
-                plugin_id: record.manifest.plugin_id.clone(),
-                version: record.manifest.version.clone(),
-                api_version: record.manifest.api_version.clone(),
-                deployment: format!(
-                    "{:?}",
-                    PluginDeploymentKind::default_for_artifact(
-                        &record.manifest.artifact.artifact_type
-                    )
-                )
-                .to_ascii_lowercase(),
-                enabled: record.enabled,
-                runner_link: record
-                    .runtime
-                    .as_ref()
-                    .map(|runtime| runtime.runner_link.clone()),
+            .map(|selection| selection.id.trim().to_string())
+            .collect::<BTreeSet<_>>();
+        plugin_ids.extend(
+            catalog
+                .candidates
+                .iter()
+                .map(|record| record.manifest.plugin_id.clone()),
+        );
+        let plugins = plugin_ids
+            .into_iter()
+            .map(|plugin_id| {
+                let active = catalog
+                    .records
+                    .iter()
+                    .find(|record| record.manifest.plugin_id == plugin_id);
+                PluginStatus {
+                    configured: self
+                        .config
+                        .plugins
+                        .configured
+                        .iter()
+                        .any(|selection| selection.enabled && selection.id.trim() == plugin_id),
+                    active_deployment: active
+                        .map(|record| deployment_name(&deployment_for(record))),
+                    preferred_deployment: state.plugins.get(&plugin_id).map(deployment_name),
+                    candidates: catalog
+                        .candidates
+                        .iter()
+                        .filter(|record| record.manifest.plugin_id == plugin_id)
+                        .map(|record| PluginCandidateStatus {
+                            deployment: deployment_name(&deployment_for(record)),
+                            version: record.manifest.version.clone(),
+                            api_version: record.manifest.api_version.clone(),
+                            sha256: record.manifest.artifact.sha256.clone(),
+                            path: record.manifest_path.display().to_string(),
+                            available: true,
+                            runner_link: record
+                                .runtime
+                                .as_ref()
+                                .map(|runtime| runtime.runner_link.clone()),
+                        })
+                        .collect(),
+                    plugin_id,
+                }
             })
-            .collect::<Vec<_>>();
-        ControlResponse::ok(plugins)
+            .collect();
+        let diagnostics = catalog
+            .diagnostics
+            .iter()
+            .map(|item| PluginInventoryDiagnostic {
+                manifest_path: item.manifest_path.display().to_string(),
+                plugin_id: item.plugin_id.clone(),
+                deployment: item.deployment.as_ref().map(deployment_name),
+                detail: item.detail.clone(),
+            })
+            .collect();
+        ControlResponse::ok(PluginListResponse {
+            plugins,
+            diagnostics,
+        })
     }
 
     async fn plugin_reload(&self) -> ControlResponse {
-        let new_catalog = match load_catalog(&self.config, &self.builtin_registry) {
+        let state = self
+            .deployment_state
+            .lock()
+            .expect("deployment state mutex")
+            .clone();
+        let new_catalog =
+            match load_catalog_with_state(&self.config, &self.builtin_registry, &state) {
+                Ok(catalog) => catalog,
+                Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+            };
+        self.reload_catalog(new_catalog).await
+    }
+
+    async fn plugin_deployment_set(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<PluginDeploymentParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        self.change_plugin_deployment(param.plugin_id, Some(param.deployment))
+            .await
+    }
+
+    async fn plugin_deployment_clear(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<PluginDeploymentClearParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        self.change_plugin_deployment(param.plugin_id, None).await
+    }
+
+    async fn change_plugin_deployment(
+        &self,
+        plugin_id: String,
+        deployment: Option<PluginDeploymentKind>,
+    ) -> ControlResponse {
+        if !self
+            .config
+            .plugins
+            .configured
+            .iter()
+            .any(|selection| selection.enabled && selection.id.trim() == plugin_id.trim())
+        {
+            return ControlResponse::err(ControlError::BadRequest(format!(
+                "plugin {plugin_id} is not enabled by plugins.configured"
+            )));
+        }
+        let previous = self
+            .deployment_state
+            .lock()
+            .expect("deployment state mutex")
+            .clone();
+        let mut next = previous.clone();
+        match deployment {
+            Some(deployment) => {
+                next.plugins.insert(plugin_id.clone(), deployment);
+            }
+            None => {
+                next.plugins.remove(&plugin_id);
+            }
+        }
+        let new_catalog = match load_catalog_with_state(&self.config, &self.builtin_registry, &next)
+        {
             Ok(catalog) => catalog,
             Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
         };
+        if let Err(error) = save_deployment_state(&self.config, &next) {
+            return ControlResponse::err(ControlError::Failed(error.to_string()));
+        }
+        let response = self.reload_catalog(new_catalog).await;
+        if response.ok {
+            *self
+                .deployment_state
+                .lock()
+                .expect("deployment state mutex") = next;
+        } else if let Err(error) = save_deployment_state(&self.config, &previous) {
+            return ControlResponse::err(ControlError::Failed(format!(
+                "deployment reload failed and restoring management state failed: {error}"
+            )));
+        }
+        response
+    }
+
+    async fn reload_catalog(&self, new_catalog: PluginCatalog) -> ControlResponse {
         let previous_generation = {
             let guard = self.host_runtime.lock().expect("host runtime mutex");
             let Some(runtime) = guard.as_ref() else {
@@ -772,14 +942,26 @@ impl ServiceRuntimeInner {
             runtime.host_context().registry_generation()
         };
         let registry_generation = previous_generation.saturating_add(1);
-        let prepared = match runtime_bootstrapper(
+        let (prepared, runtime_lock) = match runtime_bootstrapper(
             &self.config,
             &new_catalog,
             &self.native_runner_factories,
             self.runtime_client.clone(),
         )
         .and_then(|(bootstrapper, profile)| {
-            Ok(bootstrapper.prepare_reload(profile, registry_generation)?)
+            let mut lock = resolve_load_plan(
+                &new_catalog
+                    .records
+                    .iter()
+                    .map(|record| record.manifest.clone())
+                    .collect::<Vec<_>>(),
+                &profile,
+            )?;
+            lock.registry_generation = registry_generation;
+            Ok((
+                bootstrapper.prepare_reload(profile, registry_generation)?,
+                lock,
+            ))
         }) {
             Ok(reload) => reload,
             Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
@@ -797,6 +979,10 @@ impl ServiceRuntimeInner {
                 Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
             }
         };
+
+        if let Err(error) = write_runtime_lock(&self.config, &runtime_lock) {
+            return ControlResponse::err(ControlError::Failed(error.to_string()));
+        }
 
         *self.catalog.lock().expect("catalog mutex") = new_catalog;
         let runner_errors = reconcile_supervised_sidecars(
@@ -991,16 +1177,189 @@ impl ServiceRuntimeInner {
     }
 }
 
+#[cfg(test)]
 fn load_catalog(
     config: &ServiceConfig,
     builtin_registry: &BuiltinRegistry,
 ) -> ServiceRuntimeResult<PluginCatalog> {
-    let builtin = builtin_registry.load_requested(&config.plugins.builtin)?;
-    Ok(PluginCatalog::scan(
+    let preferences = load_deployment_state(config)?;
+    load_catalog_with_state(config, builtin_registry, &preferences)
+}
+
+fn load_catalog_with_state(
+    config: &ServiceConfig,
+    builtin_registry: &BuiltinRegistry,
+    preferences: &PluginDeploymentState,
+) -> ServiceRuntimeResult<PluginCatalog> {
+    let builtin = builtin_registry.load_all()?;
+    let inventory = PluginInventory::scan(
         &config.plugins.dynamic_dirs,
         &config.plugins.disabled_dir,
         builtin,
-    )?)
+    )?;
+    resolve_catalog(config, inventory, preferences)
+}
+
+fn resolve_catalog(
+    config: &ServiceConfig,
+    inventory: PluginInventory,
+    preferences: &PluginDeploymentState,
+) -> ServiceRuntimeResult<PluginCatalog> {
+    let mut selected = Vec::new();
+    for selection in config
+        .plugins
+        .configured
+        .iter()
+        .filter(|selection| selection.enabled)
+    {
+        let plugin_id = selection.id.trim();
+        let candidates = inventory
+            .records
+            .iter()
+            .filter(|record| record.manifest.plugin_id == plugin_id)
+            .collect::<Vec<_>>();
+        let diagnostic = || {
+            let details = inventory
+                .diagnostics
+                .iter()
+                .filter(|item| item.plugin_id.as_deref() == Some(plugin_id))
+                .map(|item| item.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if details.is_empty() {
+                "plugin is not linked or installed".into()
+            } else {
+                details
+            }
+        };
+        if candidates.is_empty() {
+            return Err(ServiceRuntimeError::PluginUnavailable {
+                plugin_id: plugin_id.into(),
+                detail: diagnostic(),
+            });
+        }
+        let chosen = if let Some(preferred) = preferences.plugins.get(plugin_id) {
+            candidates
+                .iter()
+                .copied()
+                .find(|record| deployment_for(record) == *preferred)
+                .ok_or_else(|| ServiceRuntimeError::PluginDeploymentUnavailable {
+                    plugin_id: plugin_id.into(),
+                    deployment: preferred.clone(),
+                    detail: diagnostic(),
+                })?
+        } else if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let builtin = candidates
+                .iter()
+                .copied()
+                .find(|record| deployment_for(record) == PluginDeploymentKind::Builtin);
+            let builtin_abi_only = candidates.iter().all(|record| {
+                matches!(
+                    deployment_for(record),
+                    PluginDeploymentKind::Builtin | PluginDeploymentKind::Abi
+                )
+            });
+            if builtin_abi_only {
+                builtin.ok_or_else(|| ServiceRuntimeError::PluginDeploymentAmbiguous {
+                    plugin_id: plugin_id.into(),
+                })?
+            } else {
+                return Err(ServiceRuntimeError::PluginDeploymentAmbiguous {
+                    plugin_id: plugin_id.into(),
+                });
+            }
+        };
+        if deployment_for(chosen) != PluginDeploymentKind::Builtin {
+            if let Some(builtin) = candidates
+                .iter()
+                .copied()
+                .find(|record| deployment_for(record) == PluginDeploymentKind::Builtin)
+            {
+                if builtin.manifest.business_surface() != chosen.manifest.business_surface() {
+                    return Err(ServiceRuntimeError::PluginBusinessSurfaceMismatch {
+                        plugin_id: plugin_id.into(),
+                    });
+                }
+            }
+        }
+        selected.push(chosen.clone());
+    }
+    Ok(PluginCatalog::resolved(inventory, selected))
+}
+
+fn deployment_for(record: &PluginRecord) -> PluginDeploymentKind {
+    PluginDeploymentKind::default_for_artifact(&record.manifest.artifact.artifact_type)
+}
+
+fn deployment_name(deployment: &PluginDeploymentKind) -> String {
+    format!("{deployment:?}").to_ascii_lowercase()
+}
+
+fn deployment_state_path(config: &ServiceConfig) -> std::path::PathBuf {
+    config.service.data_dir.join("plugin-deployments.json")
+}
+
+fn load_deployment_state(config: &ServiceConfig) -> ServiceRuntimeResult<PluginDeploymentState> {
+    let path = deployment_state_path(config);
+    if !path.is_file() {
+        return Ok(PluginDeploymentState {
+            version: deployment_state_version(),
+            plugins: BTreeMap::new(),
+        });
+    }
+    let bytes = fs::read(&path).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    let state: PluginDeploymentState = serde_json::from_slice(&bytes).map_err(|error| {
+        ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })?;
+    if state.version != deployment_state_version() {
+        return Err(ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: format!("unsupported state version {}", state.version),
+        });
+    }
+    Ok(state)
+}
+
+fn save_deployment_state(
+    config: &ServiceConfig,
+    state: &PluginDeploymentState,
+) -> ServiceRuntimeResult<()> {
+    let path = deployment_state_path(config);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+        ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })?;
+    let temporary = path.with_extension("json.pending");
+    fs::write(&temporary, bytes).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+        path: temporary.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
+    fs::rename(&temporary, &path).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })
 }
 
 fn builtin_registry() -> BuiltinRegistry {
@@ -1071,7 +1430,40 @@ fn boot_core(
         blocking_threads: config.core.blocking_threads,
         ..HostRuntimeConfig::default()
     };
-    Ok(bootstrapper.into_host_runtime_with_config(profile, host_config)?)
+    let lock = resolve_load_plan(
+        &catalog
+            .records
+            .iter()
+            .map(|record| record.manifest.clone())
+            .collect::<Vec<_>>(),
+        &profile,
+    )?;
+    let runtime = bootstrapper.into_host_runtime_with_config(profile, host_config)?;
+    write_runtime_lock(config, &lock)?;
+    Ok(runtime)
+}
+
+fn write_runtime_lock(
+    config: &ServiceConfig,
+    lock: &mutsuki_runtime_contracts::RuntimeLock,
+) -> ServiceRuntimeResult<()> {
+    let path = config.service.run_dir.join("runtime.lock.json");
+    fs::create_dir_all(&config.service.run_dir).map_err(|error| {
+        ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })?;
+    let bytes = serde_json::to_vec_pretty(lock).map_err(|error| {
+        ServiceRuntimeError::PluginDeploymentState {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })?;
+    fs::write(&path, bytes).map_err(|error| ServiceRuntimeError::PluginDeploymentState {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })
 }
 
 fn runtime_bootstrapper(
@@ -1085,9 +1477,6 @@ fn runtime_bootstrapper(
     let mut deployments = BTreeMap::new();
 
     for record in &catalog.records {
-        if !record.enabled {
-            continue;
-        }
         if !is_bootable_record(record) {
             continue;
         }
@@ -1104,6 +1493,7 @@ fn runtime_bootstrapper(
                 record,
                 config,
                 runtime_client.clone(),
+                configured_plugin_config(config, &record.manifest.plugin_id),
             )?);
         } else {
             bootstrapper.register_manifest(record.manifest.clone());
@@ -1115,8 +1505,11 @@ fn runtime_bootstrapper(
     }
 
     for factory in native_runner_factories {
-        bootstrapper
-            .register_builtin_runner(factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?);
+        let runner = factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?;
+        let plugin_id = &runner.descriptor().plugin_id;
+        if deployments.get(plugin_id) == Some(&PluginDeploymentKind::Builtin) {
+            bootstrapper.register_builtin_runner(runner);
+        }
     }
     Ok((
         bootstrapper,
@@ -1130,6 +1523,16 @@ fn runtime_bootstrapper(
             allow_hot_reload: true,
         },
     ))
+}
+
+fn configured_plugin_config(config: &ServiceConfig, plugin_id: &str) -> Value {
+    config
+        .plugins
+        .configured
+        .iter()
+        .find(|selection| selection.enabled && selection.id.trim() == plugin_id)
+        .map(|selection| selection.config.clone())
+        .unwrap_or(Value::Null)
 }
 
 fn is_bootable_record(record: &PluginRecord) -> bool {
@@ -1241,7 +1644,6 @@ fn reload_drain_timeout(config: &ServiceConfig, catalog: &PluginCatalog) -> Dura
     let max_plugin_timeout = catalog
         .records
         .iter()
-        .filter(|record| record.enabled)
         .map(|record| record.manifest.lifecycle.unload_timeout_ms)
         .max()
         .unwrap_or(0);
@@ -1454,7 +1856,7 @@ mod tests {
             "test.configured"
         }
 
-        fn install(
+        fn prepare(
             &self,
             config: &Value,
             builder: ServiceRuntimeBuilder,
@@ -1489,22 +1891,15 @@ mod tests {
             .install_configured_plugins()
             .unwrap();
 
-        assert!(
-            builder
-                .config
-                .plugins
-                .builtin
-                .contains(&"test.configured".into())
+        assert_eq!(
+            builder.builtin_registry.load_all().unwrap().records.len(),
+            1
         );
     }
 
     #[test]
-    fn configured_plugin_catalog_rejects_unknown_duplicate_and_raw_credentials() {
+    fn configured_plugin_catalog_rejects_duplicate_and_raw_credentials() {
         let cases = [
-            (
-                vec![configured_selection("missing", json!({}))],
-                "configured plugin factory is not registered",
-            ),
             (
                 vec![
                     configured_selection("test.configured", json!({"mode": "enabled"})),
@@ -1532,6 +1927,58 @@ mod tests {
                 .expect("configuration must fail");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn deployment_resolver_defaults_to_builtin_and_honors_host_preference() {
+        let mut config = ServiceConfig::default();
+        config.plugins.configured = vec![configured_selection("test.choice", Value::Null)];
+        let builtin_manifest = minimal_manifest("test.choice");
+        let mut abi_manifest = builtin_manifest.clone();
+        abi_manifest.artifact.artifact_type = ArtifactType::Abi;
+        abi_manifest.artifact.path = "test_choice.dll".into();
+        abi_manifest.artifact.sha256 = format!("sha256:{}", "1".repeat(64));
+        let inventory = PluginInventory {
+            records: vec![
+                PluginRecord {
+                    manifest_path: "<builtin>".into(),
+                    manifest: builtin_manifest,
+                    runtime: None,
+                    resolved_artifact: None,
+                },
+                PluginRecord {
+                    manifest_path: "plugin.toml".into(),
+                    manifest: abi_manifest,
+                    runtime: None,
+                    resolved_artifact: Some("test_choice.dll".into()),
+                },
+            ],
+            diagnostics: Vec::new(),
+        };
+        let default = resolve_catalog(
+            &config,
+            inventory.clone(),
+            &PluginDeploymentState::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            deployment_for(&default.records[0]),
+            PluginDeploymentKind::Builtin
+        );
+
+        let preferred = resolve_catalog(
+            &config,
+            inventory,
+            &PluginDeploymentState {
+                version: deployment_state_version(),
+                plugins: [("test.choice".into(), PluginDeploymentKind::Abi)].into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            deployment_for(&preferred.records[0]),
+            PluginDeploymentKind::Abi
+        );
     }
 
     #[test]
@@ -1859,7 +2306,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_reload_failure_preserves_catalog_and_generation() {
+    async fn deployment_management_persists_only_available_configured_choice() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        let unavailable = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginDeploymentSet,
+                params: json!({ "plugin_id": TEST_PLUGIN_ID, "deployment": "abi" }),
+            })
+            .await;
+        assert!(!unavailable.ok);
+        assert!(!deployment_state_path(&inner.config).exists());
+
+        let selected = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginDeploymentSet,
+                params: json!({ "plugin_id": TEST_PLUGIN_ID, "deployment": "builtin" }),
+            })
+            .await;
+        assert!(selected.ok);
+        let state = load_deployment_state(&inner.config).unwrap();
+        assert_eq!(
+            state.plugins.get(TEST_PLUGIN_ID),
+            Some(&PluginDeploymentKind::Builtin)
+        );
+
+        let cleared = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::PluginDeploymentClear,
+                params: json!({ "plugin_id": TEST_PLUGIN_ID }),
+            })
+            .await;
+        assert!(cleared.ok);
+        assert!(
+            load_deployment_state(&inner.config)
+                .unwrap()
+                .plugins
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_reload_keeps_unselected_invalid_artifact_as_diagnostic() {
         let dir = tempdir().expect("temp dir");
         let inner = test_started_runtime_inner("token", dir.path());
         std::fs::create_dir_all(dir.path().join("installed").join("bad")).expect("plugin dir");
@@ -1876,18 +2367,18 @@ mod tests {
                 params: Value::Null,
             })
             .await;
-        assert!(!response.ok);
-        assert_eq!(response.error.expect("error").code, "failed");
+        assert!(response.ok);
 
         let status = inner.core_status();
         let status: CoreStatus =
             serde_json::from_value(status.result.expect("status")).expect("core status");
-        assert_eq!(status.registry_generation, Some(1));
+        assert_eq!(status.registry_generation, Some(2));
         let plugins = inner.plugin_list();
-        let plugins: Vec<PluginStatus> =
+        let plugins: PluginListResponse =
             serde_json::from_value(plugins.result.expect("plugins")).expect("plugin list");
-        assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].plugin_id, TEST_PLUGIN_ID);
+        assert_eq!(plugins.plugins.len(), 1);
+        assert_eq!(plugins.plugins[0].plugin_id, TEST_PLUGIN_ID);
+        assert_eq!(plugins.diagnostics.len(), 1);
     }
 
     #[tokio::test]
@@ -1903,7 +2394,6 @@ mod tests {
         let plugin = mutsuki_service_plugin_loader::PluginToml {
             manifest,
             runtime: None,
-            enabled: Some(true),
         };
         std::fs::write(
             plugin_dir.join("plugin.toml"),
@@ -1921,13 +2411,14 @@ mod tests {
         assert!(response.ok);
         let reload: PluginReloadResponse =
             serde_json::from_value(response.result.expect("result")).expect("reload response");
-        assert_eq!(reload.plugin_count, 2);
+        assert_eq!(reload.plugin_count, 1);
 
         let plugins = inner.plugin_list();
-        let plugins: Vec<PluginStatus> =
+        let plugins: PluginListResponse =
             serde_json::from_value(plugins.result.expect("plugins")).expect("plugin list");
         assert!(
             plugins
+                .plugins
                 .iter()
                 .any(|plugin| plugin.plugin_id == "mutsuki.dynamic.test")
         );
@@ -1959,7 +2450,6 @@ mod tests {
         config.ipc.enabled = false;
         config.observe.console = false;
         config.service.log_dir = dir.path().join("logs");
-        config.plugins.builtin.clear();
         config.plugins.dynamic_dirs.clear();
 
         let result = ServiceRuntimeBuilder::new(config)
@@ -1984,7 +2474,6 @@ mod tests {
         config.ipc.enabled = false;
         config.observe.console = false;
         config.service.log_dir = dir.path().join("logs");
-        config.plugins.builtin.clear();
         config.plugins.dynamic_dirs.clear();
 
         let runtime = ServiceRuntimeBuilder::new(config)
@@ -2014,9 +2503,16 @@ mod tests {
         config.service.home_dir = dir.path().to_path_buf();
         config.service.log_dir = dir.path().join("logs");
         config.service.run_dir = dir.path().join("run");
-        config.plugins.builtin.clear();
         config.plugins.dynamic_dirs.clear();
         config.plugins.disabled_dir = dir.path().join("disabled");
+        config.plugins.configured = [
+            "test.stage.first",
+            "test.stage.second",
+            "test.stage.terminal",
+        ]
+        .into_iter()
+        .map(|id| configured_selection(id, Value::Null))
+        .collect();
         config.runners.graceful_shutdown_ms = 250;
 
         let terminal_count = Arc::new(AtomicUsize::new(0));
@@ -2172,7 +2668,6 @@ mod tests {
         config.ipc.token = Some("test-token".into());
         config.observe.console = false;
         config.service.log_dir = dir.path().join("logs");
-        config.plugins.builtin.clear();
         config.plugins.dynamic_dirs.clear();
         config.runners.graceful_shutdown_ms = 50;
         let runtime = ServiceRuntimeBuilder::new(config)
@@ -2398,9 +2893,10 @@ mod tests {
         let mut config = ServiceConfig::default();
         config.ipc.token = Some(token.into());
         config.service.home_dir = root.to_path_buf();
+        config.service.data_dir = root.join("data");
         config.service.log_dir = root.join("logs");
         config.service.run_dir = root.join("run");
-        config.plugins.builtin = vec![TEST_PLUGIN_ID.into()];
+        config.plugins.configured = vec![configured_selection(TEST_PLUGIN_ID, Value::Null)];
         config.plugins.dynamic_dirs = vec![root.join("installed")];
         config.plugins.disabled_dir = root.join("disabled");
         let registry = test_builtin_registry();
@@ -2418,6 +2914,10 @@ mod tests {
             native_runner_factories: Vec::new(),
             health_probes: BTreeMap::new(),
             runtime_client,
+            deployment_state: Mutex::new(PluginDeploymentState {
+                version: deployment_state_version(),
+                plugins: BTreeMap::new(),
+            }),
             shutdown_tx: Mutex::new(None),
         }
     }

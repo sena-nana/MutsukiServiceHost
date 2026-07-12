@@ -32,9 +32,10 @@ templates can expose only the settings their users are expected to change while 
 continues to own advanced runtime defaults.
 
 If no control token is provided through config, `MUTSUKI_CONTROL_TOKEN`, or CLI `--token`, ServiceHost creates `<home>/run/control.token` and reuses it for local clients.
-# Configured native plugins
+# Configured plugins
 
-Linked native plugins may be selected without adding domain fields to `ServiceConfig`:
+Every business plugin is selected through the same product configuration, regardless of whether
+the Host resolves it to a linked builtin or an installed ABI/process artifact:
 
 ```toml
 [[plugins.configured]]
@@ -46,10 +47,16 @@ mode = "owner-defined"
 credential_key = "HOST_SECRET_KEY"
 ```
 
-The product binary must register the matching `ConfiguredPluginFactory`. Unknown or duplicate
-IDs fail startup. The nested config is opaque to ServiceHost, but raw `secret`, `token`,
+Builtin plugins require a matching `ConfiguredPluginFactory`; ABI-only plugins validate the same
+config during `plugin.initialize`. Missing artifacts and duplicate IDs fail startup. The nested
+config is opaque to ServiceHost, but raw `secret`, `token`,
 `password` and `api_key` values are rejected; use owner-defined `_key` or `_ref` fields resolved
 at the Host boundary.
+
+`dynamic_dirs` is installation inventory only and never enables a plugin. Host management choices
+are stored in `<data>/plugin-deployments.json`; without a choice, a sole deployment is selected and
+builtin wins when builtin and ABI are both available. The exact active deployment is written to
+`<run>/runtime.lock.json`.
 
 ## Secret file backend
 
