@@ -1,30 +1,14 @@
-# Control API Skill
+---
+name: control-api
+description: Change ServiceHost local control requests, responses, IPC transports, authentication, status, health, task operations, plugin control, runner control, log tailing, or CLI-facing contracts.
+---
 
-用于本地控制 API、IPC transport、CLI 客户端和鉴权。
+# Control API
 
-## 边界
+- Keep the control plane local by default and token-authenticated; debug TCP requires explicit enablement.
+- Expose service/core/plugin/runner/task/log/health control only, not a parallel business runtime.
+- Use `TaskHandle` for cancellation and outcomes and preserve structured errors.
+- Return real backend state; missing capability must be unavailable, never fabricated.
+- Keep secrets out of responses and logs.
 
-- 第一版默认只允许本地控制面。
-- Windows 使用 Named Pipe；Linux/macOS 使用 Unix Domain Socket；调试 TCP 必须显式启用。
-- API 只做 service/core/plugin/runner/task/log/health 控制和查询，不实现业务管理后台。
-
-## 方法
-
-必须保持结构化请求/响应：
-
-- `service.status`
-- `service.shutdown`
-- `core.status`
-- `plugin.list`
-- `plugin.reload`
-- `plugin.call`（控制面 facade，不是并行业务 runtime 路径）
-- `runner.list`
-- `runner.restart`
-- `runner.stop`
-- `task.list`
-- `task.cancel`（内部使用 `TaskHandle`）
-- `task.outcome`（内部使用 `TaskHandle`）
-- `health.check`
-- `log.tail`
-
-所有请求必须携带 control token，除非显式处于测试模式。
+Test authentication, transport boundaries, invalid requests and real state transitions.

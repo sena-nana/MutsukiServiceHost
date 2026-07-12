@@ -1,15 +1,14 @@
-# Observe Skill
+---
+name: observe
+description: Change ServiceHost structured logging, trace, health aggregation, panic or crash capture, runner output, recent errors, or observability control responses.
+---
 
-用于结构化日志、trace、health、panic hook、runner stdout/stderr 和 crash report。
+# Observe
 
-## 边界
+- Aggregate runtime health while leaving domain health semantics to the owning plugin.
+- Emit structured logs and traces with correlation context.
+- Redact tokens and secrets before disk, IPC or console output.
+- Preserve existing panic hooks and write crash data under the configured home.
+- Report degraded/unhealthy when a real component fails; do not synthesize healthy placeholders.
 
-- ServiceHost 统一聚合运行级观测。
-- 插件领域健康信息由插件提供，Host 只聚合。
-- secret/token 不进入普通日志。
-
-## 要求
-
-- 日志目录来自配置，默认写入 `<MUTSUKI_HOME>/logs`。
-- panic hook 必须落文件并保留原 hook 行为。
-- health 至少包含 service、core、plugin、runner、recent error。
+Test redaction, health aggregation, panic capture and bounded log tailing.

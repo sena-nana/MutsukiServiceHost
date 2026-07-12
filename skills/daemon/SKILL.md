@@ -1,14 +1,14 @@
-# Daemon Skill
+---
+name: daemon
+description: Change ServiceHost foreground mode, Windows Service, systemd, launchd, install or uninstall commands, service start or stop, process identity, or long-running daemon integration.
+---
 
-用于 Windows Service、systemd、launchd 和长期运行安装。
+# Daemon
 
-## 第一版
+- Manage only the ServiceHost process; do not add GUI, plugin-marketplace or business configuration behavior.
+- Keep foreground `run` fully functional and share the same runtime path with service mode.
+- Store tokens outside service command lines and preserve least-privilege filesystem access.
+- Return explicit unsupported errors on unimplemented platforms.
+- Coordinate stop with ServiceRuntime graceful shutdown rather than terminating immediately.
 
-- `run` 前台模式必须完整可用。
-- install/uninstall/start/stop 命令可以先提供平台能力探测和明确 unsupported 错误。
-- Windows Service 优先级高于 systemd/launchd。
-
-## 边界
-
-- 服务化只管理 ServiceHost 进程。
-- 不把 GUI、插件市场或业务配置界面放进本仓库。
+Test install arguments, token isolation, unsupported platforms and graceful service stop.

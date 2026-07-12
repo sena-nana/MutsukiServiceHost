@@ -1,18 +1,14 @@
-# Runtime Skill
+---
+name: runtime
+description: Change ServiceHost Core bootstrap, ServiceRuntimeBuilder, HostServices, event-source lifecycle, service loop, shutdown, drain, or panic boundaries.
+---
 
-用于 Core bootstrap、HostServices、生命周期、shutdown/drain、panic 边界和前台 service loop。
+# Runtime
 
-## 边界
+- Start Core only through published runtime-host/core APIs and a validated RuntimeLoadPlan.
+- Own process and EventSource lifecycle, not Core scheduling or domain behavior.
+- Make bootstrap failure unavailable/fatal; never report a service healthy without a real Core runtime.
+- Stop IPC, EventSources and runners before releasing HostRuntime.
+- Keep standard protocol wrappers in StdPlugins and product selection in product/template repositories.
 
-- 可以创建 Tokio runtime、读取 service profile、初始化 HostServices、启动 MutsukiCore、进入 service loop。
-- 不实现 Core 调度、TaskPool、RunnerRegistry、AgentLoop 或 Bot 路由。
-- Core 相关能力必须通过 `mutsuki-runtime-host` / `mutsuki-runtime-core` 的公开 API 接入。
-- Core API 缺失时先补齐上游并更新依赖，不得在 Host 中替代实现。
-
-## 实现要求
-
-- Core 启动失败必须 fail loud，不能降级为“服务已运行”。
-- shutdown 必须通知 control plane、停止 IPC、停止 runner supervisor，再释放 HostRuntime。
-- drain 是生命周期动作，不是插件业务逻辑。
-- HostServices 只暴露 OS/运行环境能力，标准协议包装属于 StdPlugins。
-- StdPlugins 由所属仓库实现，Host 只装配其公开入口。
+Test startup failure, real builder assembly, event-source stop and graceful shutdown ordering.
