@@ -137,8 +137,24 @@ impl Default for IpcTransport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginsSection {
     pub builtin: Vec<String>,
+    #[serde(default)]
+    pub configured: Vec<ConfiguredPluginSelection>,
     pub dynamic_dirs: Vec<PathBuf>,
     pub disabled_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredPluginSelection {
+    pub id: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Default for PluginsSection {
@@ -146,6 +162,7 @@ impl Default for PluginsSection {
         let home = default_home_dir();
         Self {
             builtin: Vec::new(),
+            configured: Vec::new(),
             dynamic_dirs: vec![home.join("plugins").join("installed")],
             disabled_dir: home.join("plugins").join("disabled"),
         }

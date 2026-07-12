@@ -19,6 +19,8 @@ use mutsuki_runtime_host::{
     ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner,
 };
 use mutsuki_runtime_sdk::{RuntimeClient, RuntimeClientRef, TaskSubmitterRuntimeClient};
+#[cfg(test)]
+use mutsuki_service_config::ConfiguredPluginSelection;
 use mutsuki_service_config::{ServiceConfig, filtered_environment};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
@@ -102,6 +104,16 @@ pub enum ServiceRuntimeError {
     EventSource(String),
     #[error("native runner factory failed: {0}")]
     NativeRunnerFactory(String),
+    #[error("configured plugin id must not be empty")]
+    EmptyConfiguredPluginId,
+    #[error("configured plugin {0} is selected more than once")]
+    DuplicateConfiguredPlugin(String),
+    #[error("configured plugin factory is not registered: {0}")]
+    UnknownConfiguredPlugin(String),
+    #[error("configured plugin {plugin_id} contains raw credential field {field}")]
+    RawConfiguredPluginSecret { plugin_id: String, field: String },
+    #[error("configured plugin {plugin_id} failed to install: {detail}")]
+    ConfiguredPluginInstall { plugin_id: String, detail: String },
 }
 
 pub type ServiceRuntimeResult<T> = Result<T, ServiceRuntimeError>;
@@ -118,11 +130,58 @@ pub struct ServiceRuntime {
 /// Product assembly boundary. All manifests, native runners and event sources are frozen at boot.
 pub struct ServiceRuntimeBuilder {
     config: ServiceConfig,
+    configured_plugins: ConfiguredPluginCatalog,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
     health_probes: BTreeMap<String, HealthProbe>,
     event_sources: Vec<Box<dyn HostEventSource>>,
+}
+
+/// Domain-neutral factory for a native product plugin selected by Host configuration.
+///
+/// Domain repositories own config decoding and installation. ServiceHost only resolves the
+/// selection before the runtime profile and load plan are frozen.
+pub trait ConfiguredPluginFactory: Send + Sync {
+    fn plugin_id(&self) -> &str;
+
+    fn install(
+        &self,
+        config: &Value,
+        builder: ServiceRuntimeBuilder,
+    ) -> Result<ServiceRuntimeBuilder, String>;
+}
+
+#[derive(Clone, Default)]
+pub struct ConfiguredPluginCatalog {
+    factories: BTreeMap<String, Arc<dyn ConfiguredPluginFactory>>,
+}
+
+impl ConfiguredPluginCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register<F>(&mut self, factory: F) -> ServiceRuntimeResult<()>
+    where
+        F: ConfiguredPluginFactory + 'static,
+    {
+        let plugin_id = factory.plugin_id().trim();
+        if plugin_id.is_empty() {
+            return Err(ServiceRuntimeError::EmptyConfiguredPluginId);
+        }
+        if self.factories.contains_key(plugin_id) {
+            return Err(ServiceRuntimeError::DuplicateConfiguredPlugin(
+                plugin_id.into(),
+            ));
+        }
+        self.factories.insert(plugin_id.into(), Arc::new(factory));
+        Ok(())
+    }
+
+    fn factory(&self, plugin_id: &str) -> Option<Arc<dyn ConfiguredPluginFactory>> {
+        self.factories.get(plugin_id).cloned()
+    }
 }
 
 struct ServiceRuntimeInner {
@@ -161,12 +220,18 @@ impl ServiceRuntimeBuilder {
     pub fn new(config: ServiceConfig) -> Self {
         Self {
             config,
+            configured_plugins: ConfiguredPluginCatalog::new(),
             builtin_registry: builtin_registry(),
             native_runner_factories: Vec::new(),
             runtime_client: Arc::new(DeferredRuntimeClient::default()),
             health_probes: BTreeMap::new(),
             event_sources: Vec::new(),
         }
+    }
+
+    pub fn with_configured_plugin_catalog(mut self, catalog: ConfiguredPluginCatalog) -> Self {
+        self.configured_plugins = catalog;
+        self
     }
 
     /// Registers and enables a product-provided builtin manifest before the load plan is built.
@@ -231,14 +296,16 @@ impl ServiceRuntimeBuilder {
     }
 
     pub async fn start(self) -> ServiceRuntimeResult<ServiceRuntime> {
+        let self_ = self.install_configured_plugins()?;
         let ServiceRuntimeBuilder {
             config,
+            configured_plugins: _,
             builtin_registry,
             native_runner_factories,
             runtime_client,
             health_probes,
             event_sources,
-        } = self;
+        } = self_;
         validate_event_sources(&event_sources, &config)?;
         let observe = mutsuki_service_observe::init_observe(&config);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -284,6 +351,76 @@ impl ServiceRuntimeBuilder {
             core_pump: Some(core_pump),
             _observe: observe,
         })
+    }
+
+    fn install_configured_plugins(mut self) -> ServiceRuntimeResult<Self> {
+        let selections = self
+            .config
+            .plugins
+            .configured
+            .iter()
+            .filter(|selection| selection.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut resolved = Vec::with_capacity(selections.len());
+        for selection in selections {
+            let plugin_id = selection.id.trim();
+            if plugin_id.is_empty() {
+                return Err(ServiceRuntimeError::EmptyConfiguredPluginId);
+            }
+            if !seen.insert(plugin_id.to_owned()) {
+                return Err(ServiceRuntimeError::DuplicateConfiguredPlugin(
+                    plugin_id.into(),
+                ));
+            }
+            if let Some(field) = raw_credential_field(&selection.config, "") {
+                return Err(ServiceRuntimeError::RawConfiguredPluginSecret {
+                    plugin_id: plugin_id.into(),
+                    field,
+                });
+            }
+            let factory = self
+                .configured_plugins
+                .factory(plugin_id)
+                .ok_or_else(|| ServiceRuntimeError::UnknownConfiguredPlugin(plugin_id.into()))?;
+            resolved.push((selection, factory));
+        }
+        for (selection, factory) in resolved {
+            let plugin_id = selection.id.clone();
+            self = factory.install(&selection.config, self).map_err(|detail| {
+                ServiceRuntimeError::ConfiguredPluginInstall { plugin_id, detail }
+            })?;
+        }
+        Ok(self)
+    }
+}
+
+fn raw_credential_field(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => object.iter().find_map(|(key, value)| {
+            let field = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            let normalized = key.to_ascii_lowercase().replace('-', "_");
+            let is_reference = normalized.ends_with("_key") || normalized.ends_with("_ref");
+            let is_credential = matches!(
+                normalized.as_str(),
+                "secret" | "client_secret" | "token" | "access_token" | "password" | "api_key"
+            );
+            if is_credential && !is_reference && !value.is_null() {
+                Some(field)
+            } else {
+                raw_credential_field(value, &field)
+            }
+        }),
+        Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .find_map(|(index, value)| raw_credential_field(value, &format!("{path}[{index}]"))),
+        _ => None,
     }
 }
 
@@ -1165,6 +1302,93 @@ mod tests {
         let mut registry = BuiltinRegistry::new();
         registry.register_manifest(minimal_manifest(TEST_PLUGIN_ID));
         registry
+    }
+
+    struct TestConfiguredFactory;
+
+    impl ConfiguredPluginFactory for TestConfiguredFactory {
+        fn plugin_id(&self) -> &str {
+            "test.configured"
+        }
+
+        fn install(
+            &self,
+            config: &Value,
+            builder: ServiceRuntimeBuilder,
+        ) -> Result<ServiceRuntimeBuilder, String> {
+            if config.get("mode").and_then(Value::as_str) != Some("enabled") {
+                return Err("mode must be enabled".into());
+            }
+            Ok(builder.register_builtin_plugin(minimal_manifest(self.plugin_id())))
+        }
+    }
+
+    fn configured_selection(id: &str, config: Value) -> ConfiguredPluginSelection {
+        ConfiguredPluginSelection {
+            id: id.into(),
+            enabled: true,
+            config,
+        }
+    }
+
+    #[test]
+    fn configured_plugin_catalog_installs_before_boot_and_keeps_secret_references() {
+        let mut config = ServiceConfig::default();
+        config.plugins.configured = vec![configured_selection(
+            "test.configured",
+            json!({"mode": "enabled", "client_secret_key": "TEST_SECRET"}),
+        )];
+        let mut catalog = ConfiguredPluginCatalog::new();
+        catalog.register(TestConfiguredFactory).unwrap();
+
+        let builder = ServiceRuntimeBuilder::new(config)
+            .with_configured_plugin_catalog(catalog)
+            .install_configured_plugins()
+            .unwrap();
+
+        assert!(
+            builder
+                .config
+                .plugins
+                .builtin
+                .contains(&"test.configured".into())
+        );
+    }
+
+    #[test]
+    fn configured_plugin_catalog_rejects_unknown_duplicate_and_raw_credentials() {
+        let cases = [
+            (
+                vec![configured_selection("missing", json!({}))],
+                "configured plugin factory is not registered",
+            ),
+            (
+                vec![
+                    configured_selection("test.configured", json!({"mode": "enabled"})),
+                    configured_selection("test.configured", json!({"mode": "enabled"})),
+                ],
+                "selected more than once",
+            ),
+            (
+                vec![configured_selection(
+                    "test.configured",
+                    json!({"mode": "enabled", "client_secret": "raw"}),
+                )],
+                "contains raw credential field client_secret",
+            ),
+        ];
+        for (configured, expected) in cases {
+            let mut config = ServiceConfig::default();
+            config.plugins.configured = configured;
+            let mut catalog = ConfiguredPluginCatalog::new();
+            catalog.register(TestConfiguredFactory).unwrap();
+            let error = ServiceRuntimeBuilder::new(config)
+                .with_configured_plugin_catalog(catalog)
+                .install_configured_plugins()
+                .err()
+                .expect("configuration must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

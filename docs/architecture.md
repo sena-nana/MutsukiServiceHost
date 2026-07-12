@@ -37,6 +37,12 @@ The service host does not own task scheduling. Core remains the source of truth 
 
 `ServiceRuntimeBuilder` is the only product-side registration window. Product manifests are added to the builtin catalog before `RuntimeProfile` and the Core load plan are resolved. Native runners are registered as factories so reload can construct a fresh generation; runtime registration remains disabled.
 
+Products that select linked native plugins from configuration register a domain-owned
+`ConfiguredPluginFactory` in `ConfiguredPluginCatalog`. ServiceHost resolves
+`[[plugins.configured]]` before boot, rejects unknown or duplicate selections and raw credential
+values, then lets the owner factory decode its opaque config and contribute through the same
+`ServiceRuntimeBuilder` window. ServiceHost never interprets domain fields.
+
 Factories that initialize fallible external clients use
 `register_fallible_builtin_runner`. Their errors fail initial Core boot or the
 prepared reload with a structured Host error instead of panicking inside a
