@@ -2,12 +2,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("configured service file does not exist: {path}")]
+    MissingConfigFile { path: PathBuf },
     #[error("failed to read config file {path}: {source}")]
     ReadFile {
         path: PathBuf,
@@ -18,6 +21,18 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("failed to read secret file {path}: {source}")]
+    ReadSecretFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse secret file {path}: {source}")]
+    ParseSecretFile {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("invalid secret file {path}: {detail}")]
+    InvalidSecretFile { path: PathBuf, detail: String },
     #[error("failed to create directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -50,6 +65,26 @@ pub struct ServiceConfig {
     pub observe: ObserveSection,
     #[serde(default)]
     pub security: SecuritySection,
+    #[serde(skip)]
+    secret_store: SecretStore,
+}
+
+#[derive(Clone, Default)]
+pub struct SecretStore(Arc<BTreeMap<String, String>>);
+
+impl std::fmt::Debug for SecretStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretStore")
+            .field("entries", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SecretStore {
+    pub fn resolve(&self, key: &str) -> Option<String> {
+        self.0.get(&normalize_secret_key(key)).cloned()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,9 +243,11 @@ impl Default for ObserveSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecuritySection {
     pub control_token_env: String,
     pub secret_env_prefix: String,
+    pub secret_file: Option<PathBuf>,
 }
 
 impl Default for SecuritySection {
@@ -218,6 +255,7 @@ impl Default for SecuritySection {
         Self {
             control_token_env: "MUTSUKI_CONTROL_TOKEN".into(),
             secret_env_prefix: "MUTSUKI_SECRET_".into(),
+            secret_file: None,
         }
     }
 }
@@ -237,17 +275,16 @@ impl ServiceConfig {
     /// adapters; task payloads and ordinary configuration should only store
     /// the key passed to this method.
     pub fn secret(&self, key: &str) -> Option<String> {
-        let key = key
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        env::var(format!("{}{key}", self.security.secret_env_prefix)).ok()
+        let key = normalize_secret_key(key);
+        env::var(format!("{}{key}", self.security.secret_env_prefix))
+            .ok()
+            .or_else(|| self.secret_store.resolve(&key))
+    }
+
+    /// Snapshot used only by Host boundaries that must resolve secret keys
+    /// after service configuration has been loaded.
+    pub fn secret_store(&self) -> SecretStore {
+        self.secret_store.clone()
     }
 
     pub fn load(overrides: ConfigOverrides) -> ConfigResult<Self> {
@@ -259,10 +296,14 @@ impl ServiceConfig {
         }
         config.resolve_relative_dirs();
 
+        let explicit_config_file = overrides.config_file.is_some();
         let local_file = overrides
             .config_file
             .clone()
             .unwrap_or_else(|| config.service.home_dir.join("config").join("service.toml"));
+        if explicit_config_file && !local_file.is_file() {
+            return Err(ConfigError::MissingConfigFile { path: local_file });
+        }
 
         let local_profile = read_optional_config(&local_file)?
             .map(|file_config| file_config.service.profile)
@@ -295,10 +336,60 @@ impl ServiceConfig {
         if let Some(token) = overrides.control_token {
             config.ipc.token = Some(token);
         }
+        config.load_secret_file(&local_file)?;
         config.resolve_relative_dirs();
         config.ensure_dirs()?;
         config.ensure_control_token()?;
         Ok(config)
+    }
+
+    fn load_secret_file(&mut self, local_file: &Path) -> ConfigResult<()> {
+        let Some(configured_path) = self.security.secret_file.clone() else {
+            self.secret_store = SecretStore::default();
+            return Ok(());
+        };
+        let path = if configured_path.is_absolute() {
+            configured_path
+        } else {
+            local_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(configured_path)
+        };
+        let content = fs::read_to_string(&path).map_err(|source| ConfigError::ReadSecretFile {
+            path: path.clone(),
+            source,
+        })?;
+        let file: SecretFile =
+            toml::from_str(&content).map_err(|source| ConfigError::ParseSecretFile {
+                path: path.clone(),
+                source,
+            })?;
+        let mut secrets = BTreeMap::new();
+        for (raw_key, value) in file.secrets {
+            let key = normalize_secret_key(&raw_key);
+            if key.is_empty() {
+                return Err(ConfigError::InvalidSecretFile {
+                    path,
+                    detail: "secret key must not be empty".into(),
+                });
+            }
+            if value.trim().is_empty() {
+                return Err(ConfigError::InvalidSecretFile {
+                    path,
+                    detail: format!("secret {raw_key} must not be empty"),
+                });
+            }
+            if secrets.insert(key.clone(), value).is_some() {
+                return Err(ConfigError::InvalidSecretFile {
+                    path,
+                    detail: format!("duplicate normalized secret key {key}"),
+                });
+            }
+        }
+        self.security.secret_file = Some(path);
+        self.secret_store = SecretStore(Arc::new(secrets));
+        Ok(())
     }
 
     pub fn control_token(&self) -> &str {
@@ -410,6 +501,25 @@ impl ServiceConfig {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretFile {
+    secrets: BTreeMap<String, String>,
+}
+
+fn normalize_secret_key(key: &str) -> String {
+    key.trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn verify_directory_access(path: &Path) -> ConfigResult<()> {
     let access_error = |source| ConfigError::DirectoryAccess {
         path: path.to_path_buf(),
@@ -501,7 +611,11 @@ pub fn filtered_environment(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn directory_access_probe_is_cleaned_up() {
@@ -510,5 +624,119 @@ mod tests {
         verify_directory_access(dir.path()).unwrap();
 
         assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn secret_file_loads_relative_to_config_and_environment_overrides_it() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config_path = write_product_config(root.path(), "local.secret.toml");
+        fs::write(
+            root.path().join("local.secret.toml"),
+            "[secrets]\nQQBOT_CLIENT_SECRET = \"FILE_SECRET\"\n",
+        )
+        .unwrap();
+
+        let config = ServiceConfig::load(ConfigOverrides {
+            config_file: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            config.secret("qqbot-client-secret").as_deref(),
+            Some("FILE_SECRET")
+        );
+        assert!(!format!("{config:?}").contains("FILE_SECRET"));
+        assert!(!toml::to_string(&config).unwrap().contains("FILE_SECRET"));
+
+        unsafe { env::set_var("MUTSUKI_SECRET_QQBOT_CLIENT_SECRET", "ENV_SECRET") };
+        assert_eq!(
+            config.secret("QQBOT_CLIENT_SECRET").as_deref(),
+            Some("ENV_SECRET")
+        );
+        unsafe { env::remove_var("MUTSUKI_SECRET_QQBOT_CLIENT_SECRET") };
+    }
+
+    #[test]
+    fn explicit_config_and_secret_files_fail_loud() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_config = root.path().join("missing.toml");
+        assert!(matches!(
+            ServiceConfig::load(ConfigOverrides {
+                config_file: Some(missing_config.clone()),
+                ..Default::default()
+            }),
+            Err(ConfigError::MissingConfigFile { path }) if path == missing_config
+        ));
+
+        let config_path = write_product_config(root.path(), "missing.secret.toml");
+        assert!(matches!(
+            ServiceConfig::load(ConfigOverrides {
+                config_file: Some(config_path),
+                ..Default::default()
+            }),
+            Err(ConfigError::ReadSecretFile { .. })
+        ));
+    }
+
+    #[test]
+    fn secret_file_rejects_malformed_empty_and_duplicate_entries() {
+        for (name, content, expected) in [
+            ("malformed", "not = [valid", "parse"),
+            (
+                "empty",
+                "[secrets]\nQQBOT_CLIENT_SECRET = \"  \"\n",
+                "invalid",
+            ),
+            (
+                "duplicate",
+                "[secrets]\n\"qqbot-client-secret\" = \"one\"\nQQBOT_CLIENT_SECRET = \"two\"\n",
+                "invalid",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let secret_name = format!("{name}.secret.toml");
+            let config_path = write_product_config(root.path(), &secret_name);
+            fs::write(root.path().join(secret_name), content).unwrap();
+            let error = ServiceConfig::load(ConfigOverrides {
+                config_file: Some(config_path),
+                ..Default::default()
+            })
+            .unwrap_err();
+            match expected {
+                "parse" => assert!(matches!(error, ConfigError::ParseSecretFile { .. })),
+                "invalid" => assert!(matches!(error, ConfigError::InvalidSecretFile { .. })),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn write_product_config(root: &Path, secret_file: &str) -> PathBuf {
+        let path = root.join("local.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"[service]
+profile = "test"
+instance_id = "test"
+home_dir = "{}"
+data_dir = "data"
+log_dir = "logs"
+plugin_dir = "plugins"
+run_dir = "run"
+
+[ipc]
+enabled = false
+transport = "named-pipe"
+name = "secret-test"
+
+[security]
+secret_file = "{secret_file}"
+"#,
+                root.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        path
     }
 }

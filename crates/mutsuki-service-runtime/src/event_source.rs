@@ -9,7 +9,7 @@ use futures::FutureExt;
 use mutsuki_runtime_contracts::{TaskBatch, TaskHandle, TaskOutcome};
 use mutsuki_runtime_core::RuntimeResult;
 use mutsuki_runtime_sdk::TaskSubmitter;
-use mutsuki_service_config::ServiceConfig;
+use mutsuki_service_config::{SecretStore, ServiceConfig};
 use mutsuki_service_control::EventSourceStatus;
 use tokio::sync::{mpsc, watch};
 
@@ -73,6 +73,7 @@ pub struct HostEventSourceConfig {
     home_dir: String,
     data_dir: String,
     secret_env_prefix: String,
+    secret_store: SecretStore,
 }
 
 impl HostEventSourceConfig {
@@ -83,6 +84,7 @@ impl HostEventSourceConfig {
             home_dir: config.service.home_dir.to_string_lossy().into_owned(),
             data_dir: config.service.data_dir.to_string_lossy().into_owned(),
             secret_env_prefix: config.security.secret_env_prefix.clone(),
+            secret_store: config.secret_store(),
         }
     }
 
@@ -107,7 +109,9 @@ impl HostEventSourceConfig {
                 }
             })
             .collect::<String>();
-        std::env::var(format!("{}{key}", self.secret_env_prefix)).ok()
+        std::env::var(format!("{}{key}", self.secret_env_prefix))
+            .ok()
+            .or_else(|| self.secret_store.resolve(&key))
     }
 
     pub(crate) fn contains_secret(&self, key: &str) -> bool {

@@ -58,7 +58,7 @@ same frozen assembly window. Probe snapshots appear under
 `HealthReport.components`; they must not mutate runtime state or expose
 secrets.
 
-`HostEventSource` represents a long-lived external connection. Its context exposes only a Core `TaskSubmitter`, a shutdown token, read-only non-secret service configuration, environment-backed secret lookup, structured logging, and the source instance id. It cannot access `TaskPool`, `StateStore`, or `EventLog`. The host isolates source errors and panics, tracks lifecycle/health, supports explicit restart, and bounds shutdown by the configured graceful timeout.
+`HostEventSource` represents a long-lived external connection. Its context exposes only a Core `TaskSubmitter`, a shutdown token, read-only non-secret service configuration, Host-backed secret lookup, structured logging, and the source instance id. Secrets may come from a dedicated ignored TOML file or the environment, with environment values taking precedence; neither source is exposed through ordinary configuration or debug output. The source cannot access `TaskPool`, `StateStore`, or `EventLog`. The host isolates source errors and panics, tracks lifecycle/health, supports explicit restart, and bounds shutdown by the configured graceful timeout.
 
 An event source can declare required secret keys on its descriptor. ServiceHost
 resolves only their presence through the configured Host secret backend before

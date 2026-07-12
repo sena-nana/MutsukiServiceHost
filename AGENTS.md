@@ -25,7 +25,7 @@
 - 配置选择的原生插件只通过通用 `ConfiguredPluginCatalog` 在 boot 前安装；Host 不解析领域 config，也不内建领域 factory。
 - JSONL 编解码与通用子进程 transport 使用 Core host helper；本仓库只拥有发现、环境策略、监督、重启和停止。
 - 修复问题先定位根因，选择正确层级修正，禁止只为绕过症状打补丁。
-- 配置、控制 API、Runner 环境、secret 和日志必须默认安全：本地访问、token 鉴权、secret 不进普通日志、外部 Runner 不默认继承完整环境。
+- 配置、控制 API、Runner 环境、secret 和日志必须默认安全：本地访问、token 鉴权、产品配置只保存 secret 引用；专用本地 secret 文件必须显式引用、被版本控制忽略且不进入序列化/Debug/普通日志；外部 Runner 不默认继承完整环境。
 - 禁止仓库外 Cargo `path`/本地 `[patch]`；跨仓库依赖使用远端 Git URL 和固定 `rev`，并在独立 checkout 验证。
 - 新测试必须验证功能行为；禁止低价值字符串/日志硬匹配测试。
 
