@@ -1189,6 +1189,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
             output_ref: None,
             reason: None,
             error_code: None,
+            evidence: BTreeMap::new(),
         },
         Some(TaskOutcome::Completed {
             task_id,
@@ -1199,20 +1200,32 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
             output_ref,
             reason: None,
             error_code: None,
+            evidence: BTreeMap::new(),
         },
-        Some(TaskOutcome::Failed { task_id, error }) => TaskOutcomeView {
-            task_id,
-            status: "failed".into(),
-            output_ref: None,
-            reason: Some(error.route.clone()),
-            error_code: Some(error.code),
-        },
+        Some(TaskOutcome::Failed { task_id, error }) => {
+            let evidence = error
+                .evidence
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    serde_json::to_value(value).ok().map(|value| (key, value))
+                })
+                .collect();
+            TaskOutcomeView {
+                task_id,
+                status: "failed".into(),
+                output_ref: None,
+                reason: Some(error.route),
+                error_code: Some(error.code),
+                evidence,
+            }
+        }
         Some(TaskOutcome::Cancelled { task_id, reason }) => TaskOutcomeView {
             task_id,
             status: "cancelled".into(),
             output_ref: None,
             reason,
             error_code: None,
+            evidence: BTreeMap::new(),
         },
         Some(TaskOutcome::Expired { task_id, reason }) => TaskOutcomeView {
             task_id,
@@ -1220,6 +1233,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
             output_ref: None,
             reason,
             error_code: None,
+            evidence: BTreeMap::new(),
         },
         Some(TaskOutcome::DeadLetter { task_id, reason }) => TaskOutcomeView {
             task_id,
@@ -1227,6 +1241,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
             output_ref: None,
             reason,
             error_code: None,
+            evidence: BTreeMap::new(),
         },
     }
 }
@@ -1551,6 +1566,31 @@ mod tests {
             serde_json::from_value(outcome.result.expect("result")).expect("outcome");
         assert_eq!(view.task_id, "cancel-task-1");
         assert_eq!(view.status, "cancelled");
+    }
+
+    #[test]
+    fn task_outcome_preserves_structured_failure_evidence() {
+        let mut error = mutsuki_runtime_contracts::RuntimeError::new(
+            mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+            "plugin.test",
+            "test.route",
+        );
+        error.evidence.insert(
+            "message".into(),
+            mutsuki_runtime_contracts::ScalarValue::String("redacted detail".into()),
+        );
+
+        let view = to_control_task_outcome(
+            "failed-task",
+            Some(TaskOutcome::Failed {
+                task_id: "failed-task".into(),
+                error,
+            }),
+        );
+
+        assert_eq!(view.status, "failed");
+        assert_eq!(view.reason.as_deref(), Some("test.route"));
+        assert_eq!(view.evidence["message"], json!("redacted detail"));
     }
 
     #[test]
