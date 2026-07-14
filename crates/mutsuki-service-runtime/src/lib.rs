@@ -451,6 +451,11 @@ impl ServiceRuntimeBuilder {
         self
     }
 
+    /// Product-data root used by owner plugins for their private durable state.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.service.data_dir
+    }
+
     /// Registers and enables a product-provided builtin manifest before the load plan is built.
     pub fn register_builtin_plugin(
         mut self,
