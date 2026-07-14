@@ -14,7 +14,7 @@ use mutsuki_runtime_contracts::{
     ResourceRef, RuntimeProfile, RuntimeProfileMode, SnapshotDescriptor, StreamPlan,
     SurfaceCompatibility, TaskBatch, TaskHandle, TaskOutcome, TaskStatus, WritePlan,
 };
-use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
+use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult, RuntimeStopState};
 #[cfg(test)]
 use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
@@ -32,12 +32,12 @@ use mutsuki_service_config::{
 };
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
-    CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
-    PluginCandidateStatus, PluginDeploymentClearParam, PluginDeploymentParam,
+    CoreDrainResponse, CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams,
+    LogTailResponse, PluginCandidateStatus, PluginDeploymentClearParam, PluginDeploymentParam,
     PluginInventoryDiagnostic, PluginListResponse, PluginReloadChange, PluginReloadResponse,
-    PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus,
-    TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
-    TaskSnapshot as ControlTaskSnapshot,
+    PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus, TaskEventPage,
+    TaskEventsAfterParam, TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
+    TaskSnapshot as ControlTaskSnapshot, TaskSubmitBatchParam, TaskSubmitBatchResponse,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -892,9 +892,12 @@ impl ServiceRuntimeInner {
             ControlMethod::RunnerStop => self.runner_stop(request.params).await,
             ControlMethod::EventSourceList => self.event_source_list(),
             ControlMethod::EventSourceRestart => self.event_source_restart(request.params).await,
+            ControlMethod::CoreBeginDrain => self.core_begin_drain(),
+            ControlMethod::TaskSubmitBatch => self.task_submit_batch(request.params),
             ControlMethod::TaskList => self.task_list(),
             ControlMethod::TaskCancel => self.task_cancel(request.params),
             ControlMethod::TaskOutcome => self.task_outcome(request.params),
+            ControlMethod::TaskEventsAfter => self.task_events_after(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
         }
@@ -1222,6 +1225,44 @@ impl ServiceRuntimeInner {
         }
     }
 
+    fn core_begin_drain(&self) -> ControlResponse {
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        match runtime.begin_drain() {
+            Ok(state) => ControlResponse::ok(CoreDrainResponse {
+                state: runtime_stop_state(state).to_owned(),
+            }),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn task_submit_batch(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<TaskSubmitBatchParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        if param.batch.tasks.is_empty() {
+            return ControlResponse::err(ControlError::BadRequest(
+                "task batch must contain at least one task".into(),
+            ));
+        }
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        match runtime.dispatch(HostRuntimeCommand::SubmitBatch(Box::new(param.batch))) {
+            Ok(HostRuntimeReply::TaskBatchSubmitted(handles)) => {
+                ControlResponse::ok(TaskSubmitBatchResponse { handles })
+            }
+            Ok(other) => ControlResponse::err(ControlError::Failed(format!(
+                "unexpected task submit reply: {other:?}"
+            ))),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
     fn task_list(&self) -> ControlResponse {
         let mut guard = self.host_runtime.lock().expect("host runtime mutex");
         let Some(runtime) = guard.as_mut() else {
@@ -1274,6 +1315,36 @@ impl ServiceRuntimeInner {
             ))),
             Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
         }
+    }
+
+    fn task_events_after(&self, params: Value) -> ControlResponse {
+        const MAX_EVENTS_PER_PAGE: usize = 1_024;
+
+        let param = match serde_json::from_value::<TaskEventsAfterParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        if param.limit == 0 || param.limit > MAX_EVENTS_PER_PAGE {
+            return ControlResponse::err(ControlError::BadRequest(format!(
+                "event page limit must be in 1..={MAX_EVENTS_PER_PAGE}"
+            )));
+        }
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        let mut events = match runtime.events_after(param.sequence) {
+            Ok(events) => events,
+            Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
+        };
+        let has_more = events.len() > param.limit;
+        events.truncate(param.limit);
+        let next_sequence = events.last().map_or(param.sequence, |event| event.sequence);
+        ControlResponse::ok(TaskEventPage {
+            next_sequence,
+            has_more,
+            events,
+        })
     }
 
     async fn health_check(&self) -> ControlResponse {
@@ -1986,6 +2057,14 @@ fn task_status_name(status: &TaskStatus) -> &'static str {
     }
 }
 
+fn runtime_stop_state(state: RuntimeStopState) -> &'static str {
+    match state {
+        RuntimeStopState::Running => "running",
+        RuntimeStopState::Draining => "draining",
+        RuntimeStopState::Aborted => "aborted",
+    }
+}
+
 fn resolve_task_handle(
     runtime: &mut HostRuntime,
     task_id: &str,
@@ -2373,6 +2452,88 @@ mod tests {
             serde_json::from_value(outcome.result.expect("result")).expect("outcome");
         assert_eq!(view.task_id, "cancel-task-1");
         assert_eq!(view.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn distributed_neutral_control_submits_observes_and_drains_core() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path());
+        let submit = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskSubmitBatch,
+                params: serde_json::to_value(TaskSubmitBatchParam {
+                    batch: TaskBatch::one(
+                        "control-batch-1",
+                        Task::new("submitted-task-1", "control.input", json!({ "value": 1 })),
+                    ),
+                })
+                .expect("submit params"),
+            })
+            .await;
+        assert!(submit.ok);
+        let submitted: TaskSubmitBatchResponse =
+            serde_json::from_value(submit.result.expect("submit result")).expect("handles");
+        assert_eq!(submitted.handles.len(), 1);
+        assert_eq!(submitted.handles[0].task_id, "submitted-task-1");
+
+        let events = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskEventsAfter,
+                params: json!({ "sequence": 0, "limit": 16 }),
+            })
+            .await;
+        assert!(events.ok);
+        let page: TaskEventPage =
+            serde_json::from_value(events.result.expect("event result")).expect("event page");
+        assert!(!page.events.is_empty());
+        assert!(page.next_sequence > 0);
+        assert!(page.events.iter().any(|event| {
+            event.kind == mutsuki_runtime_contracts::RuntimeEventKind::Task
+                && event.subject_id.as_deref() == Some("submitted-task-1")
+        }));
+
+        let invalid_events = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskEventsAfter,
+                params: json!({ "sequence": 0, "limit": 0 }),
+            })
+            .await;
+        assert!(!invalid_events.ok);
+        assert_eq!(
+            invalid_events.error.expect("invalid event error").code,
+            "bad_request"
+        );
+
+        let drain = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::CoreBeginDrain,
+                params: Value::Null,
+            })
+            .await;
+        assert!(drain.ok);
+        let drain: CoreDrainResponse =
+            serde_json::from_value(drain.result.expect("drain result")).expect("drain state");
+        assert_eq!(drain.state, "draining");
+
+        let rejected = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::TaskSubmitBatch,
+                params: serde_json::to_value(TaskSubmitBatchParam {
+                    batch: TaskBatch::one(
+                        "control-batch-2",
+                        Task::new("submitted-task-2", "control.input", json!({})),
+                    ),
+                })
+                .expect("submit params"),
+            })
+            .await;
+        assert!(!rejected.ok);
+        assert_eq!(rejected.error.expect("drain rejection").code, "failed");
     }
 
     #[test]
