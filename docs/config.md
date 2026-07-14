@@ -78,3 +78,13 @@ Secret names are normalized like environment-backed keys. Empty or duplicate nor
 missing files and malformed TOML fail startup. `MUTSUKI_SECRET_<KEY>` overrides the file value.
 Loaded values remain in the Host `SecretStore` and are excluded from serialization and debug
 output. Secret files must be ignored by version control.
+
+Owner integration crates may receive the Host-owned secret store from `ServiceRuntimeBuilder` to
+rotate a named credential after an authenticated domain flow such as QR login. Rotation is atomic,
+updates all shared Host readers, preserves secret redaction, and is unavailable without
+`security.secret_file`. Environment-backed secrets remain read-only and reject runtime rotation.
+
+The builder also exposes a Host-owned configured-plugin store when the service was loaded from a
+product config file. It atomically replaces only one selected plugin's opaque `config` table; the
+owner still validates the domain value. This keeps management flows from creating a second
+plugin-private configuration authority.

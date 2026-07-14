@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,23 @@ pub enum ConfigError {
     },
     #[error("control token is required; set MUTSUKI_CONTROL_TOKEN or configure [ipc].token")]
     MissingControlToken,
+    #[error("Host secret rotation requires a configured secret_file")]
+    SecretRotationUnavailable,
+    #[error("Host secret {key} is controlled by environment variable {variable}")]
+    SecretEnvironmentOverride { key: String, variable: String },
+    #[error("Host secret {key} must not be empty")]
+    InvalidSecretValue { key: String },
+    #[error("configured plugin management requires a loaded product config file")]
+    ConfigMutationUnavailable,
+    #[error("configured plugin {plugin_id} was not found exactly once in {path}")]
+    ConfiguredPluginNotFound { plugin_id: String, path: PathBuf },
+    #[error("configured plugin {plugin_id} config cannot be represented as TOML: {detail}")]
+    InvalidConfiguredPluginValue { plugin_id: String, detail: String },
+    #[error("failed to persist managed config file {path}: {source}")]
+    WriteManagedFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
@@ -67,23 +84,180 @@ pub struct ServiceConfig {
     pub security: SecuritySection,
     #[serde(skip)]
     secret_store: SecretStore,
+    #[serde(skip)]
+    configured_plugin_store: Option<ConfiguredPluginStore>,
+}
+
+#[derive(Default)]
+struct SecretStoreInner {
+    entries: RwLock<BTreeMap<String, String>>,
+    path: Option<PathBuf>,
+    write_lock: Mutex<()>,
 }
 
 #[derive(Clone, Default)]
-pub struct SecretStore(Arc<BTreeMap<String, String>>);
+pub struct SecretStore(Arc<SecretStoreInner>);
 
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SecretStore")
-            .field("entries", &self.0.len())
+            .field(
+                "entries",
+                &self.0.entries.read().expect("secret store read lock").len(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl SecretStore {
     pub fn resolve(&self, key: &str) -> Option<String> {
-        self.0.get(&normalize_secret_key(key)).cloned()
+        self.0
+            .entries
+            .read()
+            .expect("secret store read lock")
+            .get(&normalize_secret_key(key))
+            .cloned()
+    }
+
+    fn rotate(&self, key: &str, value: String) -> ConfigResult<()> {
+        let key = normalize_secret_key(key);
+        if key.is_empty() || value.trim().is_empty() {
+            return Err(ConfigError::InvalidSecretValue { key });
+        }
+        let path = self
+            .0
+            .path
+            .clone()
+            .ok_or(ConfigError::SecretRotationUnavailable)?;
+        let _write = self.0.write_lock.lock().expect("secret store write lock");
+        let content = fs::read_to_string(&path).map_err(|source| ConfigError::ReadSecretFile {
+            path: path.clone(),
+            source,
+        })?;
+        let mut file: SecretFile =
+            toml::from_str(&content).map_err(|source| ConfigError::ParseSecretFile {
+                path: path.clone(),
+                source,
+            })?;
+        file.secrets
+            .retain(|candidate, _| normalize_secret_key(candidate) != key);
+        file.secrets.insert(key.clone(), value);
+        let content =
+            toml::to_string_pretty(&file).map_err(|source| ConfigError::InvalidSecretFile {
+                path: path.clone(),
+                detail: source.to_string(),
+            })?;
+        atomic_write(&path, content.as_bytes(), true)?;
+        let entries = validate_secret_entries(&path, file.secrets)?;
+        *self.0.entries.write().expect("secret store write lock") = entries;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct HostSecretStore {
+    store: SecretStore,
+    env_prefix: String,
+}
+
+impl std::fmt::Debug for HostSecretStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostSecretStore")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostSecretStore {
+    pub fn rotation_available(&self) -> bool {
+        self.store.0.path.is_some()
+    }
+
+    pub fn resolve(&self, key: &str) -> Option<String> {
+        let key = normalize_secret_key(key);
+        env::var(format!("{}{key}", self.env_prefix))
+            .ok()
+            .or_else(|| self.store.resolve(&key))
+    }
+
+    /// Atomically persists a rotated secret in the configured Host secret file.
+    /// Environment-backed secrets are intentionally immutable at runtime.
+    pub fn rotate(&self, key: &str, value: String) -> ConfigResult<()> {
+        let key = normalize_secret_key(key);
+        let variable = format!("{}{key}", self.env_prefix);
+        if env::var_os(&variable).is_some() {
+            return Err(ConfigError::SecretEnvironmentOverride { key, variable });
+        }
+        self.store.rotate(&key, value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfiguredPluginStore {
+    path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl ConfiguredPluginStore {
+    /// Atomically replaces one owner plugin's opaque config in the product config file.
+    pub fn replace_config(&self, plugin_id: &str, config: serde_json::Value) -> ConfigResult<()> {
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("configured plugin write lock");
+        let content = fs::read_to_string(&self.path).map_err(|source| ConfigError::ReadFile {
+            path: self.path.clone(),
+            source,
+        })?;
+        let mut document: toml::Value =
+            toml::from_str(&content).map_err(|source| ConfigError::ParseFile {
+                path: self.path.clone(),
+                source,
+            })?;
+        let configured = document
+            .get_mut("plugins")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|plugins| plugins.get_mut("configured"))
+            .and_then(toml::Value::as_array_mut)
+            .ok_or_else(|| ConfigError::ConfiguredPluginNotFound {
+                plugin_id: plugin_id.into(),
+                path: self.path.clone(),
+            })?;
+        let matches = configured
+            .iter()
+            .enumerate()
+            .filter(|(_, selection)| {
+                selection
+                    .get("id")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|id| id.trim() == plugin_id.trim())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index] = matches.as_slice() else {
+            return Err(ConfigError::ConfiguredPluginNotFound {
+                plugin_id: plugin_id.into(),
+                path: self.path.clone(),
+            });
+        };
+        let value =
+            json_to_toml(config).map_err(|detail| ConfigError::InvalidConfiguredPluginValue {
+                plugin_id: plugin_id.into(),
+                detail,
+            })?;
+        configured[*index]
+            .as_table_mut()
+            .expect("configured plugin selection is a TOML table")
+            .insert("config".into(), value);
+        let content = toml::to_string_pretty(&document).map_err(|source| {
+            ConfigError::InvalidConfiguredPluginValue {
+                plugin_id: plugin_id.into(),
+                detail: source.to_string(),
+            }
+        })?;
+        atomic_write(&self.path, content.as_bytes(), false)
     }
 }
 
@@ -279,16 +453,26 @@ impl ServiceConfig {
     /// adapters; task payloads and ordinary configuration should only store
     /// the key passed to this method.
     pub fn secret(&self, key: &str) -> Option<String> {
-        let key = normalize_secret_key(key);
-        env::var(format!("{}{key}", self.security.secret_env_prefix))
-            .ok()
-            .or_else(|| self.secret_store.resolve(&key))
+        self.host_secret_store().resolve(key)
     }
 
     /// Snapshot used only by Host boundaries that must resolve secret keys
     /// after service configuration has been loaded.
     pub fn secret_store(&self) -> SecretStore {
         self.secret_store.clone()
+    }
+
+    /// Host-owned secret boundary for runtime credential resolution and rotation.
+    pub fn host_secret_store(&self) -> HostSecretStore {
+        HostSecretStore {
+            store: self.secret_store.clone(),
+            env_prefix: self.security.secret_env_prefix.clone(),
+        }
+    }
+
+    /// Host-owned product config persistence boundary, available only for a loaded file.
+    pub fn configured_plugin_store(&self) -> Option<ConfiguredPluginStore> {
+        self.configured_plugin_store.clone()
     }
 
     pub fn load(overrides: ConfigOverrides) -> ConfigResult<Self> {
@@ -341,6 +525,12 @@ impl ServiceConfig {
             config.ipc.token = Some(token);
         }
         config.load_secret_file(&local_file)?;
+        if local_file.is_file() {
+            config.configured_plugin_store = Some(ConfiguredPluginStore {
+                path: local_file,
+                write_lock: Arc::new(Mutex::new(())),
+            });
+        }
         config.resolve_relative_dirs();
         config.ensure_dirs()?;
         config.ensure_control_token()?;
@@ -369,30 +559,13 @@ impl ServiceConfig {
                 path: path.clone(),
                 source,
             })?;
-        let mut secrets = BTreeMap::new();
-        for (raw_key, value) in file.secrets {
-            let key = normalize_secret_key(&raw_key);
-            if key.is_empty() {
-                return Err(ConfigError::InvalidSecretFile {
-                    path,
-                    detail: "secret key must not be empty".into(),
-                });
-            }
-            if value.trim().is_empty() {
-                return Err(ConfigError::InvalidSecretFile {
-                    path,
-                    detail: format!("secret {raw_key} must not be empty"),
-                });
-            }
-            if secrets.insert(key.clone(), value).is_some() {
-                return Err(ConfigError::InvalidSecretFile {
-                    path,
-                    detail: format!("duplicate normalized secret key {key}"),
-                });
-            }
-        }
+        let secrets = validate_secret_entries(&path, file.secrets)?;
         self.security.secret_file = Some(path);
-        self.secret_store = SecretStore(Arc::new(secrets));
+        self.secret_store = SecretStore(Arc::new(SecretStoreInner {
+            entries: RwLock::new(secrets),
+            path: self.security.secret_file.clone(),
+            write_lock: Mutex::new(()),
+        }));
         Ok(())
     }
 
@@ -505,10 +678,99 @@ impl ServiceConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SecretFile {
     secrets: BTreeMap<String, String>,
+}
+
+fn validate_secret_entries(
+    path: &Path,
+    entries: BTreeMap<String, String>,
+) -> ConfigResult<BTreeMap<String, String>> {
+    let mut secrets = BTreeMap::new();
+    for (raw_key, value) in entries {
+        let key = normalize_secret_key(&raw_key);
+        if key.is_empty() {
+            return Err(ConfigError::InvalidSecretFile {
+                path: path.to_path_buf(),
+                detail: "secret key must not be empty".into(),
+            });
+        }
+        if value.trim().is_empty() {
+            return Err(ConfigError::InvalidSecretFile {
+                path: path.to_path_buf(),
+                detail: format!("secret {raw_key} must not be empty"),
+            });
+        }
+        if secrets.insert(key.clone(), value).is_some() {
+            return Err(ConfigError::InvalidSecretFile {
+                path: path.to_path_buf(),
+                detail: format!("duplicate normalized secret key {key}"),
+            });
+        }
+    }
+    Ok(secrets)
+}
+
+fn json_to_toml(value: serde_json::Value) -> Result<toml::Value, String> {
+    match value {
+        serde_json::Value::Null => Err("null values are not representable in TOML".into()),
+        serde_json::Value::Bool(value) => Ok(toml::Value::Boolean(value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(toml::Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                i64::try_from(value)
+                    .map(toml::Value::Integer)
+                    .map_err(|_| "unsigned integer exceeds TOML range".into())
+            } else {
+                value
+                    .as_f64()
+                    .map(toml::Value::Float)
+                    .ok_or_else(|| "invalid JSON number".into())
+            }
+        }
+        serde_json::Value::String(value) => Ok(toml::Value::String(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(json_to_toml)
+            .collect::<Result<Vec<_>, _>>()
+            .map(toml::Value::Array),
+        serde_json::Value::Object(values) => values
+            .into_iter()
+            .map(|(key, value)| json_to_toml(value).map(|value| (key, value)))
+            .collect::<Result<toml::map::Map<_, _>, _>>()
+            .map(toml::Value::Table),
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> ConfigResult<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp = path.with_extension(format!("mutsuki-{nonce:x}.tmp"));
+    fs::write(&temp, bytes).map_err(|source| ConfigError::WriteManagedFile {
+        path: temp.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            ConfigError::WriteManagedFile {
+                path: temp.clone(),
+                source,
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    fs::rename(&temp, path).map_err(|source| ConfigError::WriteManagedFile {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn normalize_secret_key(key: &str) -> String {
@@ -662,6 +924,82 @@ mod tests {
             Some("ENV_SECRET")
         );
         unsafe { env::remove_var("MUTSUKI_SECRET_QQBOT_CLIENT_SECRET") };
+    }
+
+    #[test]
+    fn host_secret_rotation_is_atomic_shared_and_environment_safe() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config_path = write_product_config(root.path(), "local.secret.toml");
+        let secret_path = root.path().join("local.secret.toml");
+        fs::write(&secret_path, "[secrets]\nBILIBILI_COOKIE = \"OLD\"\n").unwrap();
+        let config = ServiceConfig::load(ConfigOverrides {
+            config_file: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+        let first = config.host_secret_store();
+        let second = config.host_secret_store();
+
+        first
+            .rotate("bilibili-cookie", "SESSDATA=ROTATED".into())
+            .unwrap();
+        assert_eq!(
+            second.resolve("BILIBILI_COOKIE").as_deref(),
+            Some("SESSDATA=ROTATED")
+        );
+        assert!(
+            fs::read_to_string(&secret_path)
+                .unwrap()
+                .contains("SESSDATA=ROTATED")
+        );
+        assert!(!format!("{first:?}").contains("SESSDATA"));
+
+        unsafe { env::set_var("MUTSUKI_SECRET_BILIBILI_COOKIE", "ENV") };
+        assert!(matches!(
+            first.rotate("BILIBILI_COOKIE", "REJECTED".into()),
+            Err(ConfigError::SecretEnvironmentOverride { .. })
+        ));
+        unsafe { env::remove_var("MUTSUKI_SECRET_BILIBILI_COOKIE") };
+    }
+
+    #[test]
+    fn configured_plugin_store_replaces_only_owner_config() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("local.toml");
+        let content = format!(
+            "[service]\nhome_dir = \"{}\"\n\n[ipc]\nenabled = false\n\n[plugins]\ndynamic_dirs = []\n\n[[plugins.configured]]\nid = \"mutsuki.bot.bilibili\"\n\n[plugins.configured.config]\ncookie_secret_key = \"BILIBILI_COOKIE\"\nsubscriptions = []\n\n[[plugins.configured]]\nid = \"other.plugin\"\n\n[plugins.configured.config]\nmode = \"kept\"\n",
+            root.path()
+                .join("home")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        fs::write(&config_path, content).unwrap();
+        let config = ServiceConfig::load(ConfigOverrides {
+            config_file: Some(config_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        config
+            .configured_plugin_store()
+            .unwrap()
+            .replace_config(
+                "mutsuki.bot.bilibili",
+                serde_json::json!({
+                    "cookie_secret_key": "BILIBILI_COOKIE",
+                    "subscriptions": [{"id": "alice", "paused": true}]
+                }),
+            )
+            .unwrap();
+
+        let persisted: toml::Value =
+            toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        let configured = persisted["plugins"]["configured"].as_array().unwrap();
+        assert_eq!(
+            configured[0]["config"]["subscriptions"][0]["id"].as_str(),
+            Some("alice")
+        );
+        assert_eq!(configured[1]["config"]["mode"].as_str(), Some("kept"));
     }
 
     #[test]

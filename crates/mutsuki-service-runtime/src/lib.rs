@@ -27,7 +27,9 @@ use mutsuki_runtime_sdk::{
 };
 #[cfg(test)]
 use mutsuki_service_config::ConfiguredPluginSelection;
-use mutsuki_service_config::{ServiceConfig, filtered_environment};
+use mutsuki_service_config::{
+    ConfiguredPluginStore, HostSecretStore, ServiceConfig, filtered_environment,
+};
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
     CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams, LogTailResponse,
@@ -454,6 +456,16 @@ impl ServiceRuntimeBuilder {
     /// Product-data root used by owner plugins for their private durable state.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.config.service.data_dir
+    }
+
+    /// Host-owned mutable secret boundary for integration crates that rotate credentials.
+    pub fn host_secret_store(&self) -> HostSecretStore {
+        self.config.host_secret_store()
+    }
+
+    /// Host-owned persistence boundary for owner-defined configured plugin data.
+    pub fn configured_plugin_store(&self) -> Option<ConfiguredPluginStore> {
+        self.config.configured_plugin_store()
     }
 
     /// Registers and enables a product-provided builtin manifest before the load plan is built.
