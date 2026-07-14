@@ -560,7 +560,7 @@ mod platform {
     }
 
     fn validate_text(value: &str, field: &str) -> Result<()> {
-        if value.contains(['\0', '\n', '\r']) {
+        if value.chars().any(char::is_control) {
             bail!("{field} contains an unsupported control character");
         }
         Ok(())
@@ -702,7 +702,7 @@ mod platform {
             .map(|argument| systemd_quote(&argument))
             .collect::<Result<Vec<_>>>()?
             .join(" ");
-        let working_directory = systemd_quote(&os_string(
+        let working_directory = systemd_path(&os_string(
             launch.home_dir.as_os_str(),
             "working directory",
         )?)?;
@@ -731,6 +731,22 @@ mod platform {
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
         ))
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn systemd_path(value: &str) -> Result<String> {
+        validate_text(value, "systemd path")?;
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' => {
+                    encoded.push(char::from(byte));
+                }
+                b'%' => encoded.push_str("%%"),
+                _ => encoded.push_str(&format!("\\x{byte:02x}")),
+            }
+        }
+        Ok(encoded)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -969,7 +985,8 @@ mod platform {
 
         #[test]
         fn systemd_definition_is_safe_and_runs_as_explicit_user() {
-            let (config, launch) = fixture();
+            let (config, mut launch) = fixture();
+            launch.home_dir = PathBuf::from("/opt/mutsuki/product home");
             let unit =
                 systemd_unit(&config, &launch, DaemonScope::System, Some("mutsuki")).unwrap();
             assert!(unit.contains("User=mutsuki"));
@@ -977,6 +994,7 @@ mod platform {
             assert!(unit.contains("KillSignal=SIGTERM"));
             assert!(unit.contains("TimeoutStopSec=4"));
             assert!(unit.contains("WantedBy=multi-user.target"));
+            assert!(unit.contains("WorkingDirectory=/opt/mutsuki/product\\x20home"));
             assert!(!unit.contains("--token"));
         }
 
