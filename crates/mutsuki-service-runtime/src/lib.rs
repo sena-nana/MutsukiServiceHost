@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use mutsuki_runtime_contracts::resource::experimental::{CommandBatch, SagaPlan};
 use mutsuki_runtime_contracts::{
     CancelPolicy, CommandPlan, ExportPlan, PlanReceipt, PluginDeploymentKind, ReadPlan,
-    RuntimeProfile, RuntimeProfileMode, SnapshotDescriptor, StreamPlan, SurfaceCompatibility,
-    TaskBatch, TaskHandle, TaskOutcome, TaskStatus, WritePlan,
+    ResourceRef, RuntimeProfile, RuntimeProfileMode, SnapshotDescriptor, StreamPlan,
+    SurfaceCompatibility, TaskBatch, TaskHandle, TaskOutcome, TaskStatus, WritePlan,
 };
 use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult};
 #[cfg(test)]
@@ -22,7 +22,8 @@ use mutsuki_runtime_host::{
     ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner, resolve_load_plan,
 };
 use mutsuki_runtime_sdk::{
-    ResourcePlanGateway, RuntimeClient, RuntimeClientRef, TaskSubmitter, TaskSubmitterRuntimeClient,
+    LoadedPlugin, ResourcePlanGateway, ResourceRegistryGateway, RuntimeClient, RuntimeClientRef,
+    TaskSubmitter, TaskSubmitterRuntimeClient,
 };
 #[cfg(test)]
 use mutsuki_service_config::ConfiguredPluginSelection;
@@ -59,6 +60,7 @@ pub use event_source::{
 };
 
 type NativeRunnerFactory = Arc<dyn Fn() -> Result<Box<dyn Runner>, String> + Send + Sync>;
+type LoadedPluginFactory = Arc<dyn Fn() -> Result<LoadedPlugin, String> + Send + Sync>;
 type HealthProbe = Arc<dyn Fn() -> Value + Send + Sync>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +89,7 @@ struct DeferredRuntimeClient {
     runtime: OnceLock<RuntimeClientRef>,
     task_submitter: OnceLock<Arc<dyn TaskSubmitter>>,
     resource_gateway: OnceLock<Arc<dyn ResourcePlanGateway>>,
+    resource_registry: OnceLock<Arc<dyn ResourceRegistryGateway>>,
 }
 
 impl DeferredRuntimeClient {
@@ -94,6 +97,7 @@ impl DeferredRuntimeClient {
         &self,
         task_submitter: Arc<dyn TaskSubmitter>,
         resource_gateway: Arc<dyn ResourcePlanGateway>,
+        resource_registry: Arc<dyn ResourceRegistryGateway>,
     ) {
         let runtime = TaskSubmitterRuntimeClient::new(task_submitter.clone()).into_runtime_client();
         assert!(
@@ -107,6 +111,10 @@ impl DeferredRuntimeClient {
         assert!(
             self.resource_gateway.set(resource_gateway).is_ok(),
             "resource gateway already bound"
+        );
+        assert!(
+            self.resource_registry.set(resource_registry).is_ok(),
+            "resource registry already bound"
         );
     }
 
@@ -129,6 +137,13 @@ impl DeferredRuntimeClient {
 
     fn resource_gateway(&self) -> RuntimeResult<Arc<dyn ResourcePlanGateway>> {
         self.resource_gateway
+            .get()
+            .cloned()
+            .ok_or_else(deferred_not_bound)
+    }
+
+    fn resource_registry(&self) -> RuntimeResult<Arc<dyn ResourceRegistryGateway>> {
+        self.resource_registry
             .get()
             .cloned()
             .ok_or_else(deferred_not_bound)
@@ -213,6 +228,43 @@ impl ResourcePlanGateway for DeferredRuntimeClient {
     }
 }
 
+impl ResourceRegistryGateway for DeferredRuntimeClient {
+    fn open_resource_descriptor(&self, ref_id: &str) -> RuntimeResult<ResourceRef> {
+        self.resource_registry()?.open_resource_descriptor(ref_id)
+    }
+
+    fn create_blob_resource(
+        &self,
+        provider_id: &str,
+        schema: &str,
+        bytes: Vec<u8>,
+    ) -> RuntimeResult<ResourceRef> {
+        self.resource_registry()?
+            .create_blob_resource(provider_id, schema, bytes)
+    }
+
+    fn create_cow_state_resource(
+        &self,
+        provider_id: &str,
+        kind_id: &str,
+        schema: &str,
+        bytes: Vec<u8>,
+    ) -> RuntimeResult<ResourceRef> {
+        self.resource_registry()?
+            .create_cow_state_resource(provider_id, kind_id, schema, bytes)
+    }
+
+    fn create_capability_resource(
+        &self,
+        provider_id: &str,
+        kind_id: &str,
+        schema: &str,
+    ) -> RuntimeResult<ResourceRef> {
+        self.resource_registry()?
+            .create_capability_resource(provider_id, kind_id, schema)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceRuntimeError {
     #[error(transparent)]
@@ -278,6 +330,7 @@ pub struct ServiceRuntimeBuilder {
     configured_plugins: ConfiguredPluginCatalog,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    loaded_plugin_factories: BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
     health_probes: BTreeMap<String, HealthProbe>,
     event_sources: Vec<Box<dyn HostEventSource>>,
@@ -324,6 +377,21 @@ impl ConfiguredPluginCatalog {
         Ok(())
     }
 
+    /// Atomically merges another owner catalog and rejects any duplicate plugin id.
+    pub fn merge(&mut self, other: Self) -> ServiceRuntimeResult<()> {
+        if let Some(plugin_id) = other
+            .factories
+            .keys()
+            .find(|plugin_id| self.factories.contains_key(*plugin_id))
+        {
+            return Err(ServiceRuntimeError::DuplicateConfiguredPlugin(
+                plugin_id.clone(),
+            ));
+        }
+        self.factories.extend(other.factories);
+        Ok(())
+    }
+
     fn factory(&self, plugin_id: &str) -> Option<Arc<dyn ConfiguredPluginFactory>> {
         self.factories.get(plugin_id).cloned()
     }
@@ -338,6 +406,7 @@ struct ServiceRuntimeInner {
     event_sources: EventSourceSupervisor,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    loaded_plugin_factories: BTreeMap<String, LoadedPluginFactory>,
     health_probes: BTreeMap<String, HealthProbe>,
     runtime_client: Arc<DeferredRuntimeClient>,
     deployment_state: Mutex<PluginDeploymentState>,
@@ -370,6 +439,7 @@ impl ServiceRuntimeBuilder {
             configured_plugins: ConfiguredPluginCatalog::new(),
             builtin_registry: builtin_registry(),
             native_runner_factories: Vec::new(),
+            loaded_plugin_factories: BTreeMap::new(),
             runtime_client: Arc::new(DeferredRuntimeClient::default()),
             health_probes: BTreeMap::new(),
             event_sources: Vec::new(),
@@ -424,6 +494,40 @@ impl ServiceRuntimeBuilder {
         self
     }
 
+    /// Registers a recreatable runner with both nested-task and host resource services.
+    pub fn register_runtime_services_runner<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(RuntimeClientRef, Arc<dyn ResourceRegistryGateway>) -> Box<dyn Runner>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let services = self.runtime_client.clone();
+        self.native_runner_factories.push(Arc::new(move || {
+            Ok(factory(services.clone(), services.clone()))
+        }));
+        self
+    }
+
+    /// Registers a builtin plugin that must be reconstructed at boot and reload.
+    pub fn register_builtin_loaded_plugin_factory<F, E>(
+        mut self,
+        manifest: mutsuki_runtime_contracts::PluginManifest,
+        factory: F,
+    ) -> Self
+    where
+        F: Fn() -> Result<LoadedPlugin, E> + Send + Sync + 'static,
+        E: std::fmt::Display,
+    {
+        let plugin_id = manifest.plugin_id.clone();
+        self.builtin_registry.register_manifest(manifest);
+        self.loaded_plugin_factories.insert(
+            plugin_id,
+            Arc::new(move || factory().map_err(|error| error.to_string())),
+        );
+        self
+    }
+
     /// Registers a domain-neutral product component snapshot for `health`.
     pub fn register_health_probe<F>(mut self, component_id: impl Into<String>, probe: F) -> Self
     where
@@ -446,6 +550,7 @@ impl ServiceRuntimeBuilder {
             configured_plugins: _,
             builtin_registry,
             native_runner_factories,
+            loaded_plugin_factories,
             runtime_client,
             health_probes,
             event_sources,
@@ -462,11 +567,13 @@ impl ServiceRuntimeBuilder {
             &config,
             &catalog,
             &native_runner_factories,
+            &loaded_plugin_factories,
             runtime_client.clone(),
         )?;
         let task_submitter = host_runtime.host_context().task_submitter_ref();
         let resource_gateway = host_runtime.host_context().resource_gateway_ref();
-        runtime_client.bind(task_submitter.clone(), resource_gateway);
+        let resource_registry = host_runtime.host_context().resource_registry_ref();
+        runtime_client.bind(task_submitter.clone(), resource_gateway, resource_registry);
         start_supervised_sidecars(&config, &catalog, &supervisor).await;
 
         let inner = Arc::new(ServiceRuntimeInner {
@@ -478,6 +585,7 @@ impl ServiceRuntimeBuilder {
             event_sources: event_source_supervisor.clone(),
             builtin_registry,
             native_runner_factories,
+            loaded_plugin_factories,
             health_probes,
             runtime_client,
             deployment_state: Mutex::new(deployment_state),
@@ -967,6 +1075,7 @@ impl ServiceRuntimeInner {
             &self.config,
             &new_catalog,
             &self.native_runner_factories,
+            &self.loaded_plugin_factories,
             self.runtime_client.clone(),
         )
         .and_then(|(bootstrapper, profile)| {
@@ -1451,10 +1560,16 @@ fn boot_core(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    loaded_plugin_factories: &BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<HostRuntime> {
-    let (bootstrapper, profile) =
-        runtime_bootstrapper(config, catalog, native_runner_factories, runtime_client)?;
+    let (bootstrapper, profile) = runtime_bootstrapper(
+        config,
+        catalog,
+        native_runner_factories,
+        loaded_plugin_factories,
+        runtime_client,
+    )?;
     let host_config = HostRuntimeConfig {
         worker_threads: config.core.worker_threads,
         blocking_threads: config.core.blocking_threads,
@@ -1508,6 +1623,7 @@ fn runtime_bootstrapper(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    loaded_plugin_factories: &BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<(RuntimeBootstrapper, RuntimeProfile)> {
     let mut bootstrapper = RuntimeBootstrapper::new();
@@ -1533,6 +1649,14 @@ fn runtime_bootstrapper(
                 runtime_client.clone(),
                 configured_plugin_config(config, &record.manifest.plugin_id),
             )?);
+        } else if let Some(factory) = loaded_plugin_factories.get(&record.manifest.plugin_id) {
+            let plugin = factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?;
+            if plugin.manifest.business_surface() != record.manifest.business_surface() {
+                return Err(ServiceRuntimeError::PluginBusinessSurfaceMismatch {
+                    plugin_id: record.manifest.plugin_id.clone(),
+                });
+            }
+            bootstrapper.register_loaded_plugin(plugin);
         } else {
             bootstrapper.register_manifest(record.manifest.clone());
         }
@@ -1889,6 +2013,8 @@ mod tests {
 
     struct TestConfiguredFactory;
 
+    struct SecondConfiguredFactory;
+
     impl ConfiguredPluginFactory for TestConfiguredFactory {
         fn plugin_id(&self) -> &str {
             "test.configured"
@@ -1902,6 +2028,20 @@ mod tests {
             if config.get("mode").and_then(Value::as_str) != Some("enabled") {
                 return Err("mode must be enabled".into());
             }
+            Ok(builder.register_builtin_plugin(minimal_manifest(self.plugin_id())))
+        }
+    }
+
+    impl ConfiguredPluginFactory for SecondConfiguredFactory {
+        fn plugin_id(&self) -> &str {
+            "test.configured.second"
+        }
+
+        fn prepare(
+            &self,
+            _config: &Value,
+            builder: ServiceRuntimeBuilder,
+        ) -> Result<ServiceRuntimeBuilder, String> {
             Ok(builder.register_builtin_plugin(minimal_manifest(self.plugin_id())))
         }
     }
@@ -1965,6 +2105,27 @@ mod tests {
                 .expect("configuration must fail");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn configured_plugin_catalog_merge_is_atomic_and_rejects_duplicates() {
+        let mut first = ConfiguredPluginCatalog::new();
+        first.register(TestConfiguredFactory).unwrap();
+        let mut second = ConfiguredPluginCatalog::new();
+        second.register(SecondConfiguredFactory).unwrap();
+        first.merge(second).unwrap();
+        assert!(first.factory("test.configured").is_some());
+        assert!(first.factory("test.configured.second").is_some());
+
+        let mut duplicate = ConfiguredPluginCatalog::new();
+        duplicate.register(TestConfiguredFactory).unwrap();
+        let error = first.merge(duplicate).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceRuntimeError::DuplicateConfiguredPlugin(plugin_id)
+                if plugin_id == "test.configured"
+        ));
+        assert!(first.factory("test.configured.second").is_some());
     }
 
     #[test]
@@ -2948,7 +3109,14 @@ mod tests {
         let registry = test_builtin_registry();
         let catalog = load_catalog(&config, &registry).expect("catalog");
         let runtime_client = Arc::new(DeferredRuntimeClient::default());
-        let host_runtime = boot_core(&config, &catalog, &[], runtime_client.clone()).expect("core");
+        let host_runtime = boot_core(
+            &config,
+            &catalog,
+            &[],
+            &BTreeMap::new(),
+            runtime_client.clone(),
+        )
+        .expect("core");
         ServiceRuntimeInner {
             config,
             started_at: Instant::now(),
@@ -2958,6 +3126,7 @@ mod tests {
             event_sources: EventSourceSupervisor::default(),
             builtin_registry: registry,
             native_runner_factories: Vec::new(),
+            loaded_plugin_factories: BTreeMap::new(),
             health_probes: BTreeMap::new(),
             runtime_client,
             deployment_state: Mutex::new(PluginDeploymentState {
