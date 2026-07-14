@@ -8,6 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-runtime.workspace = true
+dirs.workspace = true
+plist.workspace = true
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]

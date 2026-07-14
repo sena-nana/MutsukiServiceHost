@@ -572,7 +572,10 @@ fn absolutize(home: &Path, path: &Path) -> PathBuf {
 }
 
 fn default_env_allowlist() -> Vec<String> {
+    #[cfg(windows)]
     let mut vars = vec!["PATH".to_string()];
+    #[cfg(not(windows))]
+    let vars = vec!["PATH".to_string()];
     #[cfg(windows)]
     {
         vars.extend(["SystemRoot".into(), "WINDIR".into(), "COMSPEC".into()]);

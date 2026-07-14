@@ -32,7 +32,7 @@ crates/
   mutsuki-service-control           control request/response API
   mutsuki-service-ipc               named pipe / Unix socket / TCP debug transport
   mutsuki-service-observe           logging and panic hook
-  mutsuki-service-daemon            Windows Service installation and lifecycle
+  mutsuki-service-daemon            Windows Service, launchd and systemd lifecycle
 ```
 
 ## Run
@@ -66,6 +66,33 @@ cargo run -p mutsuki-service-host -- --home .mutsuki-dev uninstall
 `install` creates an automatic Windows Service named from the configured instance id, such as
 `mutsuki-service-default`. If `--token` or `MUTSUKI_CONTROL_TOKEN` is used during installation,
 the token is stored in `<home>/run/control.token` and is not written into the service command line.
+
+## launchd and systemd
+
+macOS and Linux default to a user service. `install` writes and enables the service definition
+without starting it; `start` activates it. `stop` uses the authenticated control API so the Runtime
+drains IPC, EventSources and runners before exit, and `uninstall` also stops a running service before
+removing its definition:
+
+```powershell
+cargo run -p mutsuki-service-host -- --config path/to/service.toml install --scope user
+cargo run -p mutsuki-service-host -- --config path/to/service.toml start --scope user
+cargo run -p mutsuki-service-host -- --config path/to/service.toml stop
+cargo run -p mutsuki-service-host -- --config path/to/service.toml uninstall --scope user
+```
+
+System scope writes `/Library/LaunchDaemons` or `/etc/systemd/system` and requires both caller-managed
+elevation and an explicit non-root account. The daemon library never invokes `sudo`:
+
+```powershell
+sudo target/release/mutsuki-service --config path/to/service.toml install --scope system --service-user mutsuki
+sudo target/release/mutsuki-service --config path/to/service.toml start --scope system
+```
+
+Tokens remain outside service definitions. When installation persists an overridden token, the file
+is written to `<home>/run/control.token` with owner-only permissions and assigned to the service user.
+The local lifecycle smoke is `scripts/daemon-smoke.sh --scope user`; Ubuntu CI runs the same script in
+system scope.
 
 ## Plugin Runtime
 

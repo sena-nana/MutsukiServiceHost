@@ -363,16 +363,23 @@ mod tests {
     }
 
     fn sleeping_spec(runner_id: &str) -> ManagedRunnerSpec {
+        #[cfg(windows)]
+        let (command, args) = (
+            "powershell".into(),
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 30".into(),
+            ],
+        );
+        #[cfg(unix)]
+        let (command, args) = ("/bin/sh".into(), vec!["-c".into(), "sleep 30".into()]);
         ManagedRunnerSpec {
             runner_id: runner_id.into(),
             plugin_id: "plugin-a".into(),
             runtime: mutsuki_service_plugin_loader::ExternalRuntimeSpec {
-                command: "powershell".into(),
-                args: vec![
-                    "-NoProfile".into(),
-                    "-Command".into(),
-                    "Start-Sleep -Seconds 30".into(),
-                ],
+                command,
+                args,
                 env: BTreeMap::new(),
                 cwd: Option::<PathBuf>::None,
                 runner_link: "sidecar".into(),

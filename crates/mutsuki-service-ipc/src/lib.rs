@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use mutsuki_service_config::IpcTransport;
 use mutsuki_service_config::ServiceConfig;
@@ -23,6 +23,7 @@ pub type IpcResult<T> = Result<T, IpcError>;
 
 pub struct IpcServer {
     handle: JoinHandle<()>,
+    cleanup_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +109,24 @@ pub fn default_control_endpoint(
 impl IpcServer {
     pub fn abort(self) {
         self.handle.abort();
+        remove_cleanup_path(self.cleanup_path.as_deref());
+    }
+
+    pub async fn shutdown(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
+        remove_cleanup_path(self.cleanup_path.as_deref());
+    }
+}
+
+fn remove_cleanup_path(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %error, path = %path.display(), "failed to remove IPC endpoint");
     }
 }
 
@@ -119,12 +138,21 @@ pub async fn start_server(
         return Ok(None);
     }
     let endpoint = config.ipc_endpoint();
-    let handle = match config.ipc.transport {
-        IpcTransport::NamedPipe => start_named_pipe_server(endpoint, handler).await?,
-        IpcTransport::UnixSocket => start_unix_socket_server(endpoint, handler).await?,
-        IpcTransport::TcpDebug => start_tcp_debug_server(endpoint, handler).await?,
+    let (handle, cleanup_path) = match config.ipc.transport {
+        IpcTransport::NamedPipe => (start_named_pipe_server(endpoint, handler).await?, None),
+        IpcTransport::UnixSocket => {
+            let cleanup_path = PathBuf::from(&endpoint);
+            (
+                start_unix_socket_server(endpoint, handler).await?,
+                Some(cleanup_path),
+            )
+        }
+        IpcTransport::TcpDebug => (start_tcp_debug_server(endpoint, handler).await?, None),
     };
-    Ok(Some(IpcServer { handle }))
+    Ok(Some(IpcServer {
+        handle,
+        cleanup_path,
+    }))
 }
 
 async fn request_endpoint(
@@ -327,6 +355,14 @@ async fn request_tcp_debug(addr: String, request: ControlRequest) -> IpcResult<C
 mod tests {
     use super::*;
 
+    struct OkHandler;
+
+    impl ControlHandler for OkHandler {
+        fn handle(&self, _request: ControlRequest) -> mutsuki_service_control::ControlFuture {
+            Box::pin(async { ControlResponse::ok(Value::Null) })
+        }
+    }
+
     #[test]
     fn endpoint_helper_is_transport_specific() {
         let run_dir = Path::new("runtime");
@@ -347,5 +383,25 @@ mod tests {
             ),
             "127.0.0.1:9000"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_server_shutdown_removes_socket_path() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ServiceConfig::default();
+        config.service.run_dir = root.path().to_path_buf();
+        config.ipc.enabled = true;
+        config.ipc.transport = IpcTransport::UnixSocket;
+        config.ipc.name = "ipc-cleanup".into();
+        let endpoint = PathBuf::from(config.ipc_endpoint());
+
+        let server = start_server(&config, Arc::new(OkHandler))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(endpoint.exists());
+        server.shutdown().await;
+        assert!(!endpoint.exists());
     }
 }

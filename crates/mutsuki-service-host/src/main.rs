@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mutsuki_service_config::{ConfigOverrides, ServiceConfig};
 use mutsuki_service_control::{ControlMethod, IdParam};
 use serde_json::{Value, json};
@@ -27,9 +27,20 @@ enum Command {
     Status,
     Stop,
     Health,
-    Install,
-    Uninstall,
-    Start,
+    Install {
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+        #[arg(long)]
+        service_user: Option<String>,
+    },
+    Uninstall {
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+    },
+    Start {
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+    },
     #[command(name = "windows-service-run", hide = true)]
     WindowsServiceRun,
     #[command(subcommand)]
@@ -40,6 +51,21 @@ enum Command {
     EventSource(EventSourceCommand),
     #[command(subcommand)]
     Task(TaskCommand),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ScopeArg {
+    User,
+    System,
+}
+
+impl From<ScopeArg> for mutsuki_service_daemon::DaemonScope {
+    fn from(value: ScopeArg) -> Self {
+        match value {
+            ScopeArg::User => Self::User,
+            ScopeArg::System => Self::System,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -101,21 +127,29 @@ async fn main() -> anyhow::Result<()> {
         Command::Health => {
             request_and_print(&config, ControlMethod::HealthCheck, Value::Null).await?
         }
-        Command::Install => {
+        Command::Install {
+            scope,
+            service_user,
+        } => {
             let launch = mutsuki_service_daemon::DaemonLaunchOptions::from_config(
                 &config,
                 config_file,
                 token_override,
             )?;
-            mutsuki_service_daemon::install(&config, &launch)?;
+            mutsuki_service_daemon::install_with_scope(
+                &config,
+                &launch,
+                daemon_scope(scope),
+                service_user.as_deref(),
+            )?;
             print_daemon_action("installed", &config);
         }
-        Command::Uninstall => {
-            mutsuki_service_daemon::uninstall(&config)?;
+        Command::Uninstall { scope } => {
+            mutsuki_service_daemon::uninstall_with_scope(&config, daemon_scope(scope))?;
             print_daemon_action("uninstalled", &config);
         }
-        Command::Start => {
-            mutsuki_service_daemon::start(&config)?;
+        Command::Start { scope } => {
+            mutsuki_service_daemon::start_with_scope(&config, daemon_scope(scope))?;
             print_daemon_action("started", &config);
         }
         Command::WindowsServiceRun => {
@@ -205,6 +239,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn daemon_scope(scope: Option<ScopeArg>) -> mutsuki_service_daemon::DaemonScope {
+    scope
+        .map(Into::into)
+        .unwrap_or_else(mutsuki_service_daemon::DaemonScope::platform_default)
+}
+
 fn parse_deployment(
     value: &str,
 ) -> anyhow::Result<mutsuki_runtime_contracts::PluginDeploymentKind> {
@@ -220,10 +260,7 @@ fn parse_deployment(
 }
 
 fn print_daemon_action(action: &str, config: &ServiceConfig) {
-    println!(
-        "{action} {}",
-        mutsuki_service_daemon::windows_service_name(config)
-    );
+    println!("{action} {}", mutsuki_service_daemon::service_name(config));
 }
 
 async fn request_and_print(

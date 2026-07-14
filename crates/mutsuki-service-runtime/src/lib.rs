@@ -617,16 +617,8 @@ fn validate_event_sources(
 
 impl ServiceRuntime {
     pub async fn run_foreground(self) -> ServiceRuntimeResult<()> {
-        let ctrl_c = async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => "ctrl-c".to_string(),
-                Err(error) => {
-                    tracing::warn!(error = %error, "failed to listen for ctrl-c");
-                    "ctrl-c-listener-error".to_string()
-                }
-            }
-        };
-        self.run_until_shutdown_signal(ctrl_c).await
+        self.run_until_shutdown_signal(platform_shutdown_signal())
+            .await
     }
 
     pub async fn run_until_shutdown_signal<F>(
@@ -655,7 +647,7 @@ impl ServiceRuntime {
 
     pub async fn shutdown(mut self) {
         if let Some(server) = self.ipc_server.take() {
-            server.abort();
+            server.shutdown().await;
         }
         let graceful = Duration::from_millis(self.inner.config.runners.graceful_shutdown_ms);
         self.inner.event_sources.shutdown(graceful).await;
@@ -671,6 +663,35 @@ impl ServiceRuntime {
             .expect("host runtime mutex")
             .take();
     }
+}
+
+async fn ctrl_c_signal() -> String {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => "ctrl-c".to_string(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to listen for ctrl-c");
+            "ctrl-c-listener-error".to_string()
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn platform_shutdown_signal() -> String {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        tracing::warn!("failed to listen for SIGTERM; falling back to ctrl-c");
+        return ctrl_c_signal().await;
+    };
+    tokio::select! {
+        reason = ctrl_c_signal() => reason,
+        _ = terminate.recv() => "sigterm".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+async fn platform_shutdown_signal() -> String {
+    ctrl_c_signal().await
 }
 
 fn spawn_core_pump(
@@ -2490,8 +2511,12 @@ mod tests {
         let mut config = ServiceConfig::default();
         config.ipc.enabled = false;
         config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.data_dir = dir.path().join("data");
         config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
         config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
 
         let runtime = ServiceRuntimeBuilder::new(config)
             .register_health_probe(
@@ -2684,8 +2709,12 @@ mod tests {
         config.ipc.enabled = false;
         config.ipc.token = Some("test-token".into());
         config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.data_dir = dir.path().join("data");
         config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
         config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
         config.runners.graceful_shutdown_ms = 50;
         let runtime = ServiceRuntimeBuilder::new(config)
             .register_event_source(Box::new(FailingEventSource {
