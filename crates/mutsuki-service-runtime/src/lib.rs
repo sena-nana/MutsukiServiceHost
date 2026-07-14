@@ -509,6 +509,22 @@ impl ServiceRuntimeBuilder {
         self
     }
 
+    /// Registers a recreatable runtime-services runner with fallible artifact or client setup.
+    pub fn register_fallible_runtime_services_runner<F, E>(mut self, factory: F) -> Self
+    where
+        F: Fn(RuntimeClientRef, Arc<dyn ResourceRegistryGateway>) -> Result<Box<dyn Runner>, E>
+            + Send
+            + Sync
+            + 'static,
+        E: std::fmt::Display,
+    {
+        let services = self.runtime_client.clone();
+        self.native_runner_factories.push(Arc::new(move || {
+            factory(services.clone(), services.clone()).map_err(|error| error.to_string())
+        }));
+        self
+    }
+
     /// Registers a builtin plugin that must be reconstructed at boot and reload.
     pub fn register_builtin_loaded_plugin_factory<F, E>(
         mut self,
