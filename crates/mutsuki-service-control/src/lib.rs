@@ -5,6 +5,8 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use mutsuki_runtime_contracts::{RuntimeEvent, TaskBatch, TaskHandle};
+
 pub type ControlFuture = Pin<Box<dyn Future<Output = ControlResponse> + Send>>;
 
 pub trait ControlHandler: Send + Sync + 'static {
@@ -34,9 +36,12 @@ pub enum ControlMethod {
     RunnerStop,
     EventSourceList,
     EventSourceRestart,
+    CoreBeginDrain,
+    TaskSubmitBatch,
     TaskList,
     TaskCancel,
     TaskOutcome,
+    TaskEventsAfter,
     HealthCheck,
     LogTail,
 }
@@ -270,6 +275,36 @@ pub struct HealthReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdParam {
     pub id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSubmitBatchParam {
+    pub batch: TaskBatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskSubmitBatchResponse {
+    pub handles: Vec<TaskHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskEventsAfterParam {
+    pub sequence: u64,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskEventPage {
+    pub next_sequence: u64,
+    pub has_more: bool,
+    pub events: Vec<RuntimeEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreDrainResponse {
+    pub state: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
