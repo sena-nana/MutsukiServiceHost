@@ -94,7 +94,13 @@ EOF
 if [ "$scope" = system ]; then
   sudo "$binary" --config "$config" install --scope system --service-user "$service_user"
   installed=true
-  sudo "$binary" --config "$config" start --scope system
+  if ! sudo "$binary" --config "$config" start --scope system; then
+    unit="mutsuki-service-$instance.service"
+    sudo systemctl status "$unit" --no-pager >&2 || true
+    sudo systemctl cat "$unit" >&2 || true
+    sudo systemd-analyze verify "/etc/systemd/system/$unit" >&2 || true
+    exit 1
+  fi
 else
   "$binary" --config "$config" install --scope user
   installed=true
