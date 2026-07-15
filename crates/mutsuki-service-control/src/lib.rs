@@ -227,6 +227,8 @@ pub struct TaskOutcomeView {
     pub task_id: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

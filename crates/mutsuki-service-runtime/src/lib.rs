@@ -2001,6 +2001,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
         None => TaskOutcomeView {
             task_id: task_id.into(),
             status: "pending".into(),
+            output: None,
             output_ref: None,
             reason: None,
             error_code: None,
@@ -2008,10 +2009,12 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
         },
         Some(TaskOutcome::Completed {
             task_id,
+            output,
             output_ref,
         }) => TaskOutcomeView {
             task_id,
             status: "completed".into(),
+            output,
             output_ref,
             reason: None,
             error_code: None,
@@ -2028,6 +2031,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
             TaskOutcomeView {
                 task_id,
                 status: "failed".into(),
+                output: None,
                 output_ref: None,
                 reason: Some(error.route),
                 error_code: Some(error.code),
@@ -2037,6 +2041,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
         Some(TaskOutcome::Cancelled { task_id, reason }) => TaskOutcomeView {
             task_id,
             status: "cancelled".into(),
+            output: None,
             output_ref: None,
             reason,
             error_code: None,
@@ -2045,6 +2050,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
         Some(TaskOutcome::Expired { task_id, reason }) => TaskOutcomeView {
             task_id,
             status: "expired".into(),
+            output: None,
             output_ref: None,
             reason,
             error_code: None,
@@ -2053,6 +2059,7 @@ fn to_control_task_outcome(task_id: &str, outcome: Option<TaskOutcome>) -> TaskO
         Some(TaskOutcome::DeadLetter { task_id, reason }) => TaskOutcomeView {
             task_id,
             status: "dead_letter".into(),
+            output: None,
             output_ref: None,
             reason,
             error_code: None,
@@ -2582,6 +2589,21 @@ mod tests {
         assert_eq!(view.status, "failed");
         assert_eq!(view.reason.as_deref(), Some("test.route"));
         assert_eq!(view.evidence["message"], json!("redacted detail"));
+    }
+
+    #[test]
+    fn task_outcome_exposes_inline_business_output() {
+        let view = to_control_task_outcome(
+            "completed-task",
+            Some(TaskOutcome::Completed {
+                task_id: "completed-task".into(),
+                output: Some(json!({"answer": 42})),
+                output_ref: None,
+            }),
+        );
+
+        assert_eq!(view.status, "completed");
+        assert_eq!(view.output, Some(json!({"answer": 42})));
     }
 
     #[test]
