@@ -1333,17 +1333,18 @@ impl ServiceRuntimeInner {
         let Some(runtime) = guard.as_ref() else {
             return ControlResponse::err(ControlError::Failed("core is not running".into()));
         };
-        let mut events = match runtime.events_after(param.sequence) {
-            Ok(events) => events,
+        let page = match runtime.events_after(param.sequence, param.limit) {
+            Ok(page) => page,
             Err(error) => return ControlResponse::err(ControlError::Failed(error.to_string())),
         };
-        let has_more = events.len() > param.limit;
-        events.truncate(param.limit);
-        let next_sequence = events.last().map_or(param.sequence, |event| event.sequence);
         ControlResponse::ok(TaskEventPage {
-            next_sequence,
-            has_more,
-            events,
+            next_sequence: page.next_sequence,
+            earliest_available_sequence: page.earliest_available_sequence,
+            latest_sequence: page.latest_sequence,
+            lost: page.lost,
+            dropped: page.dropped,
+            has_more: page.truncated,
+            events: page.items,
         })
     }
 
@@ -1785,6 +1786,7 @@ fn runtime_bootstrapper(
             enabled_plugins,
             bindings: BTreeMap::new(),
             plugin_deployments: deployments,
+            observability: Default::default(),
             allow_dynamic_registration: false,
             allow_hot_reload: true,
         },
@@ -2489,6 +2491,10 @@ mod tests {
             serde_json::from_value(events.result.expect("event result")).expect("event page");
         assert!(!page.events.is_empty());
         assert!(page.next_sequence > 0);
+        assert_eq!(page.lost, 0);
+        assert_eq!(page.dropped, 0);
+        assert!(page.latest_sequence >= page.next_sequence);
+        assert!(page.earliest_available_sequence.is_some());
         assert!(page.events.iter().any(|event| {
             event.kind == mutsuki_runtime_contracts::RuntimeEventKind::Task
                 && event.subject_id.as_deref() == Some("submitted-task-1")

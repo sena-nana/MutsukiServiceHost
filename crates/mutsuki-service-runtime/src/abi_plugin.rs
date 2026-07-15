@@ -428,6 +428,7 @@ mod tests {
                 bindings: BTreeMap::new(),
                 plugin_deployments: [(manifest.plugin_id.clone(), PluginDeploymentKind::Abi)]
                     .into(),
+                observability: Default::default(),
                 allow_dynamic_registration: false,
                 allow_hot_reload: true,
             })
