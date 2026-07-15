@@ -298,6 +298,10 @@ pub struct TaskEventsAfterParam {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TaskEventPage {
     pub next_sequence: u64,
+    pub earliest_available_sequence: Option<u64>,
+    pub latest_sequence: u64,
+    pub lost: u64,
+    pub dropped: u64,
     pub has_more: bool,
     pub events: Vec<RuntimeEvent>,
 }
