@@ -49,7 +49,7 @@ use mutsuki_service_runner_supervisor::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 
 mod abi_plugin;
 mod event_source;
@@ -321,8 +321,6 @@ pub struct ServiceRuntime {
     inner: Arc<ServiceRuntimeInner>,
     shutdown_rx: Option<oneshot::Receiver<String>>,
     ipc_server: Option<IpcServer>,
-    core_pump_shutdown: watch::Sender<bool>,
-    core_pump: Option<tokio::task::JoinHandle<()>>,
     _observe: mutsuki_service_observe::ObserveGuard,
 }
 
@@ -426,11 +424,7 @@ impl Drop for ServiceRuntime {
         if let Some(server) = self.ipc_server.take() {
             server.abort();
         }
-        let _ = self.core_pump_shutdown.send(true);
         self.inner.event_sources.abort();
-        if let Some(task) = self.core_pump.take() {
-            task.abort();
-        }
     }
 }
 
@@ -591,7 +585,6 @@ impl ServiceRuntimeBuilder {
         validate_event_sources(&event_sources, &config)?;
         let observe = mutsuki_service_observe::init_observe(&config);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (core_pump_shutdown, core_pump_rx) = watch::channel(false);
         let supervisor = RunnerSupervisor::new();
         let event_source_supervisor = EventSourceSupervisor::default();
         let deployment_state = load_deployment_state(&config)?;
@@ -624,7 +617,6 @@ impl ServiceRuntimeBuilder {
             deployment_state: Mutex::new(deployment_state),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         });
-        let core_pump = spawn_core_pump(Arc::downgrade(&inner), core_pump_rx);
         let ipc_server = mutsuki_service_ipc::start_server(
             &inner.config,
             Arc::new(RuntimeControl {
@@ -640,8 +632,6 @@ impl ServiceRuntimeBuilder {
             inner,
             shutdown_rx: Some(shutdown_rx),
             ipc_server,
-            core_pump_shutdown,
-            core_pump: Some(core_pump),
             _observe: observe,
         })
     }
@@ -792,10 +782,6 @@ impl ServiceRuntime {
         }
         let graceful = Duration::from_millis(self.inner.config.runners.graceful_shutdown_ms);
         self.inner.event_sources.shutdown(graceful).await;
-        let _ = self.core_pump_shutdown.send(true);
-        if let Some(core_pump) = self.core_pump.take() {
-            let _ = core_pump.await;
-        }
         self.inner.supervisor.shutdown(graceful).await;
         let _ = self
             .inner
@@ -833,32 +819,6 @@ async fn platform_shutdown_signal() -> String {
 #[cfg(not(unix))]
 async fn platform_shutdown_signal() -> String {
     ctrl_c_signal().await
-}
-
-fn spawn_core_pump(
-    inner: std::sync::Weak<ServiceRuntimeInner>,
-    mut shutdown: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => break,
-                _ = interval.tick() => {
-                    let Some(inner) = inner.upgrade() else { break; };
-                    let result = inner
-                        .host_runtime
-                        .lock()
-                        .expect("host runtime mutex")
-                        .as_ref()
-                        .map(|runtime| runtime.dispatch(HostRuntimeCommand::TickOnce));
-                    if let Some(Err(error)) = result {
-                        tracing::error!(error = %error, "core service tick failed");
-                    }
-                }
-            }
-        }
-    })
 }
 
 struct RuntimeControl {
@@ -1676,6 +1636,7 @@ fn boot_core(
         runtime_client,
     )?;
     let host_config = HostRuntimeConfig {
+        event_driven: true,
         worker_threads: config.core.worker_threads,
         blocking_threads: config.core.blocking_threads,
         ..HostRuntimeConfig::default()
@@ -2892,6 +2853,59 @@ mod tests {
         assert_eq!(report.components["test.component"]["status"], "ok");
         assert_eq!(report.components["test.component"]["ready"], true);
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_service_runtime_does_not_tick_and_health_and_shutdown_remain_responsive() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.data_dir = dir.path().join("data");
+        config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
+        config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
+
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .start()
+            .await
+            .expect("idle runtime starts");
+        let before = runtime
+            .inner
+            .host_runtime
+            .lock()
+            .expect("runtime mutex")
+            .as_ref()
+            .expect("runtime")
+            .drive_state()
+            .expect("drive state");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let health = tokio::time::timeout(Duration::from_millis(50), runtime.inner.health_check())
+            .await
+            .expect("health remains responsive while Core actor sleeps");
+        let report: HealthReport =
+            serde_json::from_value(health.result.expect("health report")).expect("health shape");
+        assert_eq!(report.core, "ok");
+        let after = runtime
+            .inner
+            .host_runtime
+            .lock()
+            .expect("runtime mutex")
+            .as_ref()
+            .expect("runtime")
+            .drive_state()
+            .expect("drive state");
+        assert_eq!(after.current_step, before.current_step);
+        assert_eq!(after.timed_wakeups, before.timed_wakeups);
+        assert_eq!(after.next_wake_deadline, None);
+
+        tokio::time::timeout(Duration::from_millis(250), runtime.shutdown())
+            .await
+            .expect("shutdown interrupts idle actor sleep");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

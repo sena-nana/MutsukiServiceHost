@@ -1,0 +1,44 @@
+{
+  "schema": "mutsuki.service-host.issue12.driver-benchmark.v1",
+  "recorded_on": "2026-07-15",
+  "command": "cargo run --release -q -p mutsuki-service-runtime --example core_driver_benchmark",
+  "core_revision": "155081019b1aa186e4105d297dd7dfc5d9740711",
+  "configuration": {
+    "idle_duration_ms": 2000,
+    "latency_samples": 30,
+    "legacy_latency_phase": "submit immediately after a poll; wait for next 10ms tick",
+    "legacy_poll_interval_ms": 10
+  },
+  "idle": {
+    "event_driven": {
+      "logical_ticks": 0,
+      "process_cpu_ms": 0.016,
+      "timed_wakeups": 0,
+      "wall_ms": 2008.7277499999998
+    },
+    "fixed_poll": {
+      "logical_ticks": 147,
+      "process_cpu_ms": 15.270999999999999,
+      "timed_wakeups": 0,
+      "wall_ms": 2000.5149169999997
+    }
+  },
+  "platform": {
+    "arch": "aarch64",
+    "os": "macos"
+  },
+  "submit_to_completed_latency": {
+    "event_driven": {
+      "average_us": 126.45976666666667,
+      "max_us": 822.8330000000001,
+      "p95_us": 211.0,
+      "samples": 30
+    },
+    "fixed_poll": {
+      "average_us": 14006.869433333335,
+      "max_us": 16141.666,
+      "p95_us": 15375.917,
+      "samples": 30
+    }
+  }
+}
