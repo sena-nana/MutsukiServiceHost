@@ -2,7 +2,7 @@
   "schema": "mutsuki.service-host.issue12.driver-benchmark.v1",
   "recorded_on": "2026-07-15",
   "command": "cargo run --release -q -p mutsuki-service-runtime --example core_driver_benchmark",
-  "core_revision": "155081019b1aa186e4105d297dd7dfc5d9740711",
+  "core_revision": "158f87f491abe091e01ea265aeeaacf77e2eb8a5",
   "configuration": {
     "idle_duration_ms": 2000,
     "latency_samples": 30,
@@ -12,15 +12,15 @@
   "idle": {
     "event_driven": {
       "logical_ticks": 0,
-      "process_cpu_ms": 0.016,
+      "process_cpu_ms": 0.023,
       "timed_wakeups": 0,
-      "wall_ms": 2008.7277499999998
+      "wall_ms": 2008.480542
     },
     "fixed_poll": {
-      "logical_ticks": 147,
-      "process_cpu_ms": 15.270999999999999,
+      "logical_ticks": 146,
+      "process_cpu_ms": 14.936,
       "timed_wakeups": 0,
-      "wall_ms": 2000.5149169999997
+      "wall_ms": 2005.8230419999998
     }
   },
   "platform": {
@@ -29,15 +29,15 @@
   },
   "submit_to_completed_latency": {
     "event_driven": {
-      "average_us": 126.45976666666667,
-      "max_us": 822.8330000000001,
-      "p95_us": 211.0,
+      "average_us": 106.21800000000002,
+      "max_us": 668.333,
+      "p95_us": 190.75,
       "samples": 30
     },
     "fixed_poll": {
-      "average_us": 14006.869433333335,
-      "max_us": 16141.666,
-      "p95_us": 15375.917,
+      "average_us": 14146.579366666665,
+      "max_us": 16499.084,
+      "p95_us": 15435.042,
       "samples": 30
     }
   }
