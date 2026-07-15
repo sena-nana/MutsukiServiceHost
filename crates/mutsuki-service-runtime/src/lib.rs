@@ -19,7 +19,7 @@ use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult, RuntimeStopSta
 use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
-    ProcessRunnerSpec, RuntimeBootstrapper, SpawnedJsonlRunner, resolve_load_plan,
+    ProcessRunnerSpec, RunnerLimits, RuntimeBootstrapper, SpawnedJsonlRunner, resolve_load_plan,
 };
 use mutsuki_runtime_sdk::{
     LoadedPlugin, ResourcePlanGateway, ResourceRegistryGateway, RuntimeClient, RuntimeClientRef,
@@ -1327,7 +1327,7 @@ impl ServiceRuntimeInner {
         } else {
             "ok"
         };
-        let recent_errors = event_source_details
+        let mut recent_errors = event_source_details
             .iter()
             .filter_map(|source| {
                 source
@@ -1335,12 +1335,30 @@ impl ServiceRuntimeInner {
                     .as_ref()
                     .map(|error| format!("event_source:{}:{error}", source.source_id))
             })
-            .collect();
-        let components = self
+            .collect::<Vec<_>>();
+        let worker_pools = self
+            .host_runtime
+            .lock()
+            .expect("host runtime mutex")
+            .as_ref()
+            .and_then(|runtime| runtime.worker_pools().ok());
+        let worker_degraded = worker_pools
+            .as_ref()
+            .is_some_and(|pools| pools.iter().any(|pool| pool.degraded));
+        if worker_degraded {
+            recent_errors.push("worker_pool:isolation_capacity_exhausted".into());
+        }
+        let mut components = self
             .health_probes
             .iter()
             .map(|(id, probe)| (id.clone(), probe()))
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        if let Some(worker_pools) = worker_pools {
+            components.insert(
+                "worker_pools".into(),
+                serde_json::to_value(worker_pools).unwrap_or(Value::Null),
+            );
+        }
         let report = HealthReport {
             service: "ok".into(),
             core: if self
@@ -1349,7 +1367,11 @@ impl ServiceRuntimeInner {
                 .expect("host runtime mutex")
                 .is_some()
             {
-                "ok".into()
+                if worker_degraded {
+                    "degraded".into()
+                } else {
+                    "ok".into()
+                }
             } else {
                 "stopped".into()
             },
@@ -1635,10 +1657,44 @@ fn boot_core(
         loaded_plugin_factories,
         runtime_client,
     )?;
+    let worker_settings = config.core.worker_pool_settings();
+    tracing::info!(
+        worker_profile = ?config.core.worker_profile,
+        compute_threads = worker_settings.compute_threads,
+        blocking_threads = worker_settings.blocking_threads,
+        total_worker_threads = worker_settings.compute_threads + worker_settings.blocking_threads,
+        queue_capacity = worker_settings.queue_capacity,
+        max_inflight_bytes = worker_settings.max_inflight_bytes,
+        max_isolated_workers = worker_settings.max_isolated_workers,
+        runner_wall_clock_timeout_ms = ?config.core.runner_wall_clock_timeout_ms,
+        cancel_grace_period_ms = ?config.core.cancel_grace_period_ms,
+        worker_health_timeout_ms = ?config.core.worker_health_timeout_ms,
+        native_isolation = "cooperative_cancel",
+        process_isolation = "hard_terminate_and_recover",
+        "resolved Host worker topology"
+    );
     let host_config = HostRuntimeConfig {
         event_driven: true,
-        worker_threads: config.core.worker_threads,
-        blocking_threads: config.core.blocking_threads,
+        worker_threads: worker_settings.compute_threads,
+        blocking_threads: worker_settings.blocking_threads,
+        pool_queue_limit: worker_settings.queue_capacity,
+        pool_max_inflight_bytes: worker_settings.max_inflight_bytes,
+        max_isolated_workers: worker_settings.max_isolated_workers,
+        default_runner_limits: RunnerLimits {
+            wall_clock_deadline: config
+                .core
+                .runner_wall_clock_timeout_ms
+                .map(Duration::from_millis),
+            ..RunnerLimits::default()
+        },
+        cancel_grace_period: config
+            .core
+            .cancel_grace_period_ms
+            .map(Duration::from_millis),
+        worker_health_timeout: config
+            .core
+            .worker_health_timeout_ms
+            .map(Duration::from_millis),
         ..HostRuntimeConfig::default()
     };
     let lock = resolve_load_plan(
@@ -2852,6 +2908,110 @@ mod tests {
         let report: HealthReport = serde_json::from_value(response.result.unwrap()).unwrap();
         assert_eq!(report.components["test.component"]["status"], "ok");
         assert_eq!(report.components["test.component"]["ready"], true);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn health_reports_degraded_when_native_isolation_capacity_is_exhausted() {
+        struct BlockingGateRunner {
+            descriptor: RunnerDescriptor,
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl Runner for BlockingGateRunner {
+            fn descriptor(&self) -> &RunnerDescriptor {
+                &self.descriptor
+            }
+
+            fn run_batch(
+                &mut self,
+                _ctx: mutsuki_runtime_contracts::RunnerContext,
+                batch: WorkBatch,
+            ) -> RuntimeResult<CompletionBatch> {
+                let (released, wake) = &*self.gate;
+                let mut released = released.lock().expect("worker gate poisoned");
+                while !*released {
+                    released = wake.wait(released).expect("worker gate poisoned");
+                }
+                map_work_batch_entries(&batch, |task| {
+                    Ok(mutsuki_runtime_contracts::RunnerResult::completed(
+                        task.task_id.clone(),
+                    ))
+                })
+            }
+        }
+
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.data_dir = dir.path().join("data");
+        config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
+        config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
+        config.plugins.configured = vec![configured_selection("test.worker.health", Value::Null)];
+        config.core.worker_profile = mutsuki_service_config::WorkerProfile::LowResource;
+        config.core.runner_wall_clock_timeout_ms = Some(30);
+        config.core.max_isolated_workers = Some(1);
+
+        let mut descriptor = chain_descriptor(
+            "test.worker.health",
+            "test.worker.health.runner",
+            "test.worker.health.run",
+        );
+        descriptor.execution_class = ExecutionClass::Blocking;
+        let factory_descriptor = descriptor.clone();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let factory_gate = gate.clone();
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .register_builtin_plugin(runner_manifest("test.worker.health", descriptor))
+            .register_builtin_runner(move || {
+                Box::new(BlockingGateRunner {
+                    descriptor: factory_descriptor.clone(),
+                    gate: factory_gate.clone(),
+                })
+            })
+            .start()
+            .await
+            .expect("runtime starts");
+        runtime
+            .inner
+            .host_runtime
+            .lock()
+            .expect("runtime mutex")
+            .as_ref()
+            .expect("runtime")
+            .dispatch(HostRuntimeCommand::SubmitTask(Box::new(Task::new(
+                "worker-health-hang",
+                "test.worker.health.run",
+                json!({}),
+            ))))
+            .expect("task submitted");
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        let response = runtime.inner.health_check().await;
+        let report: HealthReport = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(report.core, "degraded");
+        assert!(
+            report
+                .recent_errors
+                .iter()
+                .any(|error| error == "worker_pool:isolation_capacity_exhausted")
+        );
+        assert!(
+            report.components["worker_pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pool| pool["pool_id"] == "blocking" && pool["degraded"] == true)
+        );
+
+        let (released, wake) = &*gate;
+        *released.lock().expect("worker gate poisoned") = true;
+        wake.notify_all();
         runtime.shutdown().await;
     }
 

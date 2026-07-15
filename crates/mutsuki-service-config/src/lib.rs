@@ -293,8 +293,15 @@ impl Default for ServiceSection {
 pub struct CoreSection {
     pub max_tasks: usize,
     pub shutdown_timeout_ms: u64,
-    pub worker_threads: usize,
-    pub blocking_threads: usize,
+    pub worker_profile: WorkerProfile,
+    pub worker_threads: Option<usize>,
+    pub blocking_threads: Option<usize>,
+    pub pool_queue_limit: Option<usize>,
+    pub pool_max_inflight_bytes: Option<usize>,
+    pub max_isolated_workers: Option<usize>,
+    pub runner_wall_clock_timeout_ms: Option<u64>,
+    pub cancel_grace_period_ms: Option<u64>,
+    pub worker_health_timeout_ms: Option<u64>,
 }
 
 impl Default for CoreSection {
@@ -302,10 +309,79 @@ impl Default for CoreSection {
         Self {
             max_tasks: 4096,
             shutdown_timeout_ms: 30_000,
-            worker_threads: std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(2),
-            blocking_threads: 2,
+            worker_profile: WorkerProfile::Desktop,
+            worker_threads: None,
+            blocking_threads: None,
+            pool_queue_limit: None,
+            pool_max_inflight_bytes: None,
+            max_isolated_workers: None,
+            runner_wall_clock_timeout_ms: None,
+            cancel_grace_period_ms: Some(30_000),
+            worker_health_timeout_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkerProfile {
+    LowResource,
+    #[default]
+    Desktop,
+    Server,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerPoolSettings {
+    pub compute_threads: usize,
+    pub blocking_threads: usize,
+    pub queue_capacity: usize,
+    pub max_inflight_bytes: usize,
+    pub max_isolated_workers: usize,
+}
+
+impl CoreSection {
+    pub fn worker_pool_settings(&self) -> WorkerPoolSettings {
+        let parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .max(1);
+        let profile = match self.worker_profile {
+            WorkerProfile::LowResource => WorkerPoolSettings {
+                compute_threads: 1,
+                blocking_threads: 1,
+                queue_capacity: 64,
+                max_inflight_bytes: 8 * 1024 * 1024,
+                max_isolated_workers: 1,
+            },
+            WorkerProfile::Desktop => WorkerPoolSettings {
+                compute_threads: parallelism,
+                blocking_threads: 2,
+                queue_capacity: 256,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                max_isolated_workers: 1,
+            },
+            WorkerProfile::Server => {
+                let blocking_threads = (parallelism / 4).clamp(2, 8);
+                WorkerPoolSettings {
+                    compute_threads: parallelism,
+                    blocking_threads,
+                    queue_capacity: 1024,
+                    max_inflight_bytes: 256 * 1024 * 1024,
+                    max_isolated_workers: blocking_threads,
+                }
+            }
+        };
+        WorkerPoolSettings {
+            compute_threads: self.worker_threads.unwrap_or(profile.compute_threads),
+            blocking_threads: self.blocking_threads.unwrap_or(profile.blocking_threads),
+            queue_capacity: self.pool_queue_limit.unwrap_or(profile.queue_capacity),
+            max_inflight_bytes: self
+                .pool_max_inflight_bytes
+                .unwrap_or(profile.max_inflight_bytes),
+            max_isolated_workers: self
+                .max_isolated_workers
+                .unwrap_or(profile.max_isolated_workers),
         }
     }
 }
@@ -885,6 +961,54 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn worker_profiles_keep_default_threads_close_to_compute_plus_bounded_blocking() {
+        let mut core = CoreSection {
+            worker_profile: WorkerProfile::LowResource,
+            ..CoreSection::default()
+        };
+        let low = core.worker_pool_settings();
+        assert_eq!((low.compute_threads, low.blocking_threads), (1, 1));
+
+        core.worker_profile = WorkerProfile::Desktop;
+        let desktop = core.worker_pool_settings();
+        assert_eq!(desktop.blocking_threads, 2);
+        assert!(desktop.compute_threads >= 1);
+
+        core.worker_profile = WorkerProfile::Server;
+        let server = core.worker_pool_settings();
+        assert_eq!(server.compute_threads, desktop.compute_threads);
+        assert!((2..=8).contains(&server.blocking_threads));
+        assert!(server.queue_capacity > desktop.queue_capacity);
+    }
+
+    #[test]
+    fn explicit_worker_overrides_are_applied_on_top_of_profile() {
+        let core = CoreSection {
+            worker_profile: WorkerProfile::LowResource,
+            worker_threads: Some(3),
+            blocking_threads: Some(4),
+            pool_queue_limit: Some(5),
+            pool_max_inflight_bytes: Some(6),
+            max_isolated_workers: Some(2),
+            runner_wall_clock_timeout_ms: None,
+            cancel_grace_period_ms: None,
+            worker_health_timeout_ms: None,
+            ..CoreSection::default()
+        };
+
+        assert_eq!(
+            core.worker_pool_settings(),
+            WorkerPoolSettings {
+                compute_threads: 3,
+                blocking_threads: 4,
+                queue_capacity: 5,
+                max_inflight_bytes: 6,
+                max_isolated_workers: 2,
+            }
+        );
+    }
 
     #[test]
     fn directory_access_probe_is_cleaned_up() {

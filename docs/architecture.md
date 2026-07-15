@@ -27,6 +27,8 @@ The service host does not own task scheduling. Core remains the source of truth 
 - Builtin registry boundary. Real builtin plugin crates must be linked and registered explicitly; unavailable builtin names fail startup.
 - `plugin.toml` scanning from configured plugin directories.
 - JSONL stdio external runners registered with Core via `JsonlRunner::run_batch`.
+- Shared bounded compute and blocking worker pools with real queue/entry/byte capacity snapshots.
+- Cooperative-only native cancellation and hard-terminable, recoverable process runner isolation.
 - Sidecar process supervision for external runtimes that do not expose Core runner descriptors.
 - Local control API over Windows named pipe, Unix socket, or explicit TCP debug transport.
 - Authenticated service status, core status, plugin list, runner list/restart/stop, event-source list/restart, task list/cancel/outcome, health, shutdown.

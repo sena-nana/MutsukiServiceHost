@@ -31,6 +31,20 @@ Each top-level section may be partial. Omitted fields inherit the section defaul
 templates can expose only the settings their users are expected to change while ServiceHost
 continues to own advanced runtime defaults.
 
+`core.worker_profile` selects the bounded Host worker topology:
+
+- `low-resource`: one shared compute worker and one blocking worker.
+- `desktop` (default): available parallelism for the shared compute pool plus two blocking workers.
+- `server`: available parallelism for compute plus a bounded `2..=8` blocking pool.
+
+Orchestration, synchronous runner IO, and CPU work share the compute pool. Blocking and Script
+dispatches share the bounded blocking pool; async network and event-source IO remains on Tokio.
+Advanced deployments may override `worker_threads`, `blocking_threads`, `pool_queue_limit`,
+`pool_max_inflight_bytes`, and `max_isolated_workers`, but zero values fail Host startup.
+`runner_wall_clock_timeout_ms`, `cancel_grace_period_ms`, and `worker_health_timeout_ms` enable
+Host supervision deadlines. A wall-clock timeout is a hard termination guarantee only for process
+runners; native runners remain cooperative and may cause the pool to report degraded health.
+
 If no control token is provided through config, `MUTSUKI_CONTROL_TOKEN`, or CLI `--token`, ServiceHost creates `<home>/run/control.token` and reuses it for local clients.
 # Configured plugins
 

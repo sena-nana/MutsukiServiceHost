@@ -10,8 +10,7 @@ run_dir = "run"
 [core]
 max_tasks = 4096
 shutdown_timeout_ms = 30000
-worker_threads = 4
-blocking_threads = 2
+worker_profile = "desktop"
 
 [ipc]
 enabled = true

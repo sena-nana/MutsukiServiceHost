@@ -475,7 +475,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-contracts"
 version = "0.1.0"
-source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=de7d2d4cf326fbffceb223897bbeef8aaef67bbe#de7d2d4cf326fbffceb223897bbeef8aaef67bbe"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=63ac3c9479089d5dc0e8b4245838068694f043ad#63ac3c9479089d5dc0e8b4245838068694f043ad"
 dependencies = [
  "serde",
  "serde_json",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-core"
 version = "0.1.0"
-source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=de7d2d4cf326fbffceb223897bbeef8aaef67bbe#de7d2d4cf326fbffceb223897bbeef8aaef67bbe"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=63ac3c9479089d5dc0e8b4245838068694f043ad#63ac3c9479089d5dc0e8b4245838068694f043ad"
 dependencies = [
  "mutsuki-runtime-contracts",
  "serde_json",
@@ -494,8 +494,9 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-host"
 version = "0.1.0"
-source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=de7d2d4cf326fbffceb223897bbeef8aaef67bbe#de7d2d4cf326fbffceb223897bbeef8aaef67bbe"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=63ac3c9479089d5dc0e8b4245838068694f043ad#63ac3c9479089d5dc0e8b4245838068694f043ad"
 dependencies = [
+ "crossbeam-channel",
  "mutsuki-runtime-contracts",
  "mutsuki-runtime-core",
  "mutsuki-runtime-sdk",
@@ -506,7 +507,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-sdk"
 version = "0.1.0"
-source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=de7d2d4cf326fbffceb223897bbeef8aaef67bbe#de7d2d4cf326fbffceb223897bbeef8aaef67bbe"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=63ac3c9479089d5dc0e8b4245838068694f043ad#63ac3c9479089d5dc0e8b4245838068694f043ad"
 dependencies = [
  "mutsuki-runtime-contracts",
  "mutsuki-runtime-core",
@@ -518,7 +519,7 @@ dependencies = [
 [[package]]
 name = "mutsuki-runtime-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=de7d2d4cf326fbffceb223897bbeef8aaef67bbe#de7d2d4cf326fbffceb223897bbeef8aaef67bbe"
+source = "git+https://github.com/sena-nana/MutsukiCore.git?rev=63ac3c9479089d5dc0e8b4245838068694f043ad#63ac3c9479089d5dc0e8b4245838068694f043ad"
 dependencies = [
  "proc-macro2",
  "quote",
