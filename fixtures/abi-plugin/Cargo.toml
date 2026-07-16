@@ -8,7 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mutsuki-runtime-contracts = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "1bf03b6d98b615b043ffc9f7b2236a9a96bb186f" }
-mutsuki-runtime-core = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "1bf03b6d98b615b043ffc9f7b2236a9a96bb186f" }
-mutsuki-runtime-sdk = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "1bf03b6d98b615b043ffc9f7b2236a9a96bb186f" }
+mutsuki-runtime-contracts = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "94ba3a81d6bf4fb1263007766a64ac8be3fec1ab" }
+mutsuki-runtime-core = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "94ba3a81d6bf4fb1263007766a64ac8be3fec1ab" }
+mutsuki-runtime-sdk = { git = "https://github.com/sena-nana/MutsukiCore.git", rev = "94ba3a81d6bf4fb1263007766a64ac8be3fec1ab" }
 serde_json = "1.0"
