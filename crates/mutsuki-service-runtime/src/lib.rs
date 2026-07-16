@@ -2689,6 +2689,7 @@ mod tests {
             max_frame_bytes: hello.max_frame_bytes,
             max_payload_bytes: hello.max_payload_bytes,
             max_in_flight_requests: hello.max_in_flight_requests,
+            management_reserved_requests: hello.management_reserved_requests,
             management_channel: hello.management_channel,
             feature_flags: hello.feature_flags,
             plugin: None,
