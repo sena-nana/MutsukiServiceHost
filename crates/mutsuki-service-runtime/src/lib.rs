@@ -2615,6 +2615,9 @@ mod tests {
             OrderingRequirement, RunnerContext, RunnerResult, TaskLease, WorkBatch,
             WorkResourcePlan,
         };
+        use mutsuki_runtime_wire::{
+            DEFAULT_WIRE_LIMITS, Opcode, ProtocolHello, ProtocolHelloAck, encode_jsonl_response,
+        };
 
         let descriptor = RunnerDescriptor {
             runner_id: "jsonl.test".into(),
@@ -2675,8 +2678,30 @@ mod tests {
             }],
             metadata: Vec::new(),
         };
-        let response = format!("{}\n", json!({"id":"req-1","ok":true,"result": completion}));
-        let reader = Cursor::new(response.into_bytes());
+        let hello = ProtocolHello::debug_jsonl();
+        let ack = ProtocolHelloAck {
+            protocol: hello.protocol,
+            codec_id: hello.codec_id,
+            schema_revision: hello.schema_revision,
+            max_frame_bytes: hello.max_frame_bytes,
+            max_payload_bytes: hello.max_payload_bytes,
+            max_in_flight_requests: hello.max_in_flight_requests,
+            management_channel: hello.management_channel,
+            feature_flags: hello.feature_flags,
+        };
+        let mut responses =
+            encode_jsonl_response(1, Opcode::PluginInitialize, Ok(&ack), DEFAULT_WIRE_LIMITS)
+                .expect("encode handshake response");
+        responses.extend(
+            encode_jsonl_response(
+                2,
+                Opcode::RunnerRunBatch,
+                Ok(&completion),
+                DEFAULT_WIRE_LIMITS,
+            )
+            .expect("encode run response"),
+        );
+        let reader = Cursor::new(responses);
         let writer = Cursor::new(Vec::<u8>::new());
         let mut runner = JsonlRunner::new(descriptor, reader, writer);
         let result = runner

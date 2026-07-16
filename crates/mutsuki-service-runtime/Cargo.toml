@@ -11,6 +11,7 @@ libloading.workspace = true
 mutsuki-runtime-contracts.workspace = true
 mutsuki-runtime-core.workspace = true
 mutsuki-runtime-host.workspace = true
+mutsuki-runtime-wire.workspace = true
 mutsuki-runtime-sdk.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-control.workspace = true

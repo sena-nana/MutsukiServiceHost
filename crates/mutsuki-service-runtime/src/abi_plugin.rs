@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use mutsuki_runtime_contracts::{PluginManifest, RuntimeError, ScalarValue};
 use mutsuki_runtime_core::{RuntimeFailure, RuntimeResult};
-use mutsuki_runtime_host::{JsonRequestTransport, TransportJsonlRunner, TransportResourceProvider};
+use mutsuki_runtime_host::{
+    TransportJsonlRunner, TransportResourceProvider, TypedRequestTransport,
+};
 use mutsuki_runtime_sdk::abi::{
     ABI_BRIDGE_ID, ABI_CODEC_ID, ABI_ENTRY_SYMBOL, ABI_TRANSPORT_VERSION, AbiBuffer, AbiCallResult,
     AbiEntryV1, AbiHostV1, AbiPluginV1,
@@ -15,6 +17,7 @@ use mutsuki_runtime_sdk::abi::{
 use mutsuki_runtime_sdk::{
     LoadedPlugin, RuntimeBootstrapperResourceProvider, dispatch_host_request,
 };
+use mutsuki_runtime_wire::{DEFAULT_WIRE_LIMITS, WireRequest};
 use mutsuki_service_config::ServiceConfig;
 use mutsuki_service_plugin_loader::PluginRecord;
 use serde::Deserialize;
@@ -58,8 +61,21 @@ impl Drop for AbiConnection {
     }
 }
 
-impl JsonRequestTransport for AbiConnection {
-    fn request(&self, method: &str, params: Value) -> RuntimeResult<Value> {
+impl TypedRequestTransport for AbiConnection {
+    fn request<R: WireRequest>(&self, request: &R) -> RuntimeResult<R::Response> {
+        request.validate(DEFAULT_WIRE_LIMITS).map_err(|error| {
+            abi_failure(&self.plugin_id, "abi.request_invalid", error.to_string())
+        })?;
+        let params = serde_json::to_value(request)
+            .map_err(|error| abi_failure(&self.plugin_id, "abi.encode", error.to_string()))?;
+        let value = self.request_value(R::OPCODE.method(), params)?;
+        serde_json::from_value(value)
+            .map_err(|error| abi_failure(&self.plugin_id, "abi.decode", error.to_string()))
+    }
+}
+
+impl AbiConnection {
+    fn request_value(&self, method: &str, params: Value) -> RuntimeResult<Value> {
         let _guard = self
             .request_lock
             .lock()
@@ -168,7 +184,7 @@ pub(crate) fn load_abi_plugin(
         next_request: AtomicU64::new(0),
     });
     let handshake: AbiHandshake = serde_json::from_value(
-        connection.request("plugin.initialize", json!({ "config": plugin_config }))?,
+        connection.request_value("plugin.initialize", json!({ "config": plugin_config }))?,
     )
     .map_err(|error| ServiceRuntimeError::AbiPlugin {
         plugin_id: record.manifest.plugin_id.clone(),
