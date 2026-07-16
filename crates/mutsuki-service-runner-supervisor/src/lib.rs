@@ -170,11 +170,11 @@ impl RunnerSupervisor {
             if !should_remove && !should_replace {
                 continue;
             }
-            if let Some(runner) = state.runners.get_mut(&runner_id) {
-                if let Err(error) = stop_child(runner, graceful).await {
-                    errors.push(error);
-                    continue;
-                }
+            if let Some(runner) = state.runners.get_mut(&runner_id)
+                && let Err(error) = stop_child(runner, graceful).await
+            {
+                errors.push(error);
+                continue;
             }
             state.runners.remove(&runner_id);
         }

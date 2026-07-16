@@ -487,7 +487,7 @@ mod platform {
 
     #[cfg(any(target_os = "macos", test))]
     use super::launchd_label;
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     use super::service_name;
     use super::{DaemonLaunchOptions, DaemonScope, foreground_launch_arguments};
 

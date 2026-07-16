@@ -595,7 +595,8 @@ impl ServiceRuntimeBuilder {
             &native_runner_factories,
             &loaded_plugin_factories,
             runtime_client.clone(),
-        )?;
+        )
+        .await?;
         let task_submitter = host_runtime.host_context().task_submitter_ref();
         let resource_gateway = host_runtime.host_context().resource_gateway_ref();
         let resource_registry = host_runtime.host_context().resource_registry_ref();
@@ -1074,6 +1075,7 @@ impl ServiceRuntimeInner {
             &self.loaded_plugin_factories,
             self.runtime_client.clone(),
         )
+        .await
         .and_then(|(bootstrapper, profile)| {
             let mut lock = resolve_load_plan(
                 &new_catalog
@@ -1497,18 +1499,15 @@ fn resolve_catalog(
                 });
             }
         };
-        if deployment_for(chosen) != PluginDeploymentKind::Builtin {
-            if let Some(builtin) = candidates
+        if deployment_for(chosen) != PluginDeploymentKind::Builtin
+            && let Some(builtin) = candidates
                 .iter()
-                .copied()
                 .find(|record| deployment_for(record) == PluginDeploymentKind::Builtin)
-            {
-                if builtin.manifest.business_surface() != chosen.manifest.business_surface() {
-                    return Err(ServiceRuntimeError::PluginBusinessSurfaceMismatch {
-                        plugin_id: plugin_id.into(),
-                    });
-                }
-            }
+            && builtin.manifest.business_surface() != chosen.manifest.business_surface()
+        {
+            return Err(ServiceRuntimeError::PluginBusinessSurfaceMismatch {
+                plugin_id: plugin_id.into(),
+            });
         }
         selected.push(chosen.clone());
     }
@@ -1643,7 +1642,7 @@ fn read_log_tail(
     Ok(LogTailResponse { cursor, entries })
 }
 
-fn boot_core(
+async fn boot_core(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
@@ -1656,7 +1655,8 @@ fn boot_core(
         native_runner_factories,
         loaded_plugin_factories,
         runtime_client,
-    )?;
+    )
+    .await?;
     let worker_settings = config.core.worker_pool_settings();
     tracing::info!(
         worker_profile = ?config.core.worker_profile,
@@ -1741,7 +1741,7 @@ fn restore_runtime_lock(path: &std::path::Path, previous: Option<Vec<u8>>) -> st
     }
 }
 
-fn runtime_bootstrapper(
+async fn runtime_bootstrapper(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
@@ -1765,12 +1765,15 @@ fn runtime_bootstrapper(
             record.manifest.artifact.artifact_type,
             mutsuki_runtime_contracts::ArtifactType::Abi
         ) {
-            bootstrapper.register_loaded_plugin(abi_plugin::load_abi_plugin(
-                record,
-                config,
-                runtime_client.clone(),
-                configured_plugin_config(config, &record.manifest.plugin_id),
-            )?);
+            bootstrapper.register_loaded_plugin(
+                abi_plugin::load_abi_plugin(
+                    record.clone(),
+                    config.clone(),
+                    runtime_client.clone(),
+                    configured_plugin_config(config, &record.manifest.plugin_id),
+                )
+                .await?,
+            );
         } else if let Some(factory) = loaded_plugin_factories.get(&record.manifest.plugin_id) {
             let plugin = factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?;
             if plugin.manifest.business_surface() != record.manifest.business_surface() {
@@ -2403,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn task_list_returns_live_runtime_snapshots() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         {
             let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
             let runtime = guard.as_mut().expect("runtime started");
@@ -2444,7 +2447,7 @@ mod tests {
     #[tokio::test]
     async fn task_cancel_and_outcome_use_task_handle() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         {
             let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
             let runtime = guard.as_mut().expect("runtime started");
@@ -2483,7 +2486,7 @@ mod tests {
     #[tokio::test]
     async fn distributed_neutral_control_submits_observes_and_drains_core() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         let submit = inner
             .handle_request(ControlRequest {
                 token: "token".into(),
@@ -2688,6 +2691,7 @@ mod tests {
             max_in_flight_requests: hello.max_in_flight_requests,
             management_channel: hello.management_channel,
             feature_flags: hello.feature_flags,
+            plugin: None,
         };
         let mut responses =
             encode_jsonl_response(1, Opcode::PluginInitialize, Ok(&ack), DEFAULT_WIRE_LIMITS)
@@ -2727,7 +2731,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_reload_requires_auth_and_swaps_generation() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
 
         let unauthorized = inner
             .handle_request(ControlRequest {
@@ -2771,7 +2775,7 @@ mod tests {
     #[tokio::test]
     async fn deployment_management_persists_only_available_configured_choice() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         let unavailable = inner
             .handle_request(ControlRequest {
                 token: "token".into(),
@@ -2815,7 +2819,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_reload_keeps_unselected_invalid_artifact_as_diagnostic() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         std::fs::create_dir_all(dir.path().join("installed").join("bad")).expect("plugin dir");
         std::fs::write(
             dir.path().join("installed").join("bad").join("plugin.toml"),
@@ -2847,7 +2851,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_list_reflects_catalog_after_successful_reload() {
         let dir = tempdir().expect("temp dir");
-        let inner = test_started_runtime_inner("token", dir.path());
+        let inner = test_started_runtime_inner("token", dir.path()).await;
         let plugin_dir = dir.path().join("installed").join("dynamic");
         std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
         let mut manifest = minimal_manifest("mutsuki.dynamic.test");
@@ -2970,6 +2974,10 @@ mod tests {
                 &self.descriptor
             }
 
+            #[expect(
+                clippy::result_large_err,
+                reason = "the Runner contract preserves the structured RuntimeError unchanged"
+            )]
             fn run_batch(
                 &mut self,
                 _ctx: mutsuki_runtime_contracts::RunnerContext,
@@ -3442,6 +3450,10 @@ mod tests {
             &self.descriptor
         }
 
+        #[expect(
+            clippy::result_large_err,
+            reason = "the Runner contract preserves the structured RuntimeError unchanged"
+        )]
         fn run_batch(
             &mut self,
             ctx: mutsuki_runtime_contracts::RunnerContext,
@@ -3517,7 +3529,7 @@ mod tests {
         mutsuki_runtime_host::runner_manifest(plugin_id, vec![descriptor])
     }
 
-    fn test_started_runtime_inner(token: &str, root: &Path) -> ServiceRuntimeInner {
+    async fn test_started_runtime_inner(token: &str, root: &Path) -> ServiceRuntimeInner {
         let mut config = ServiceConfig::default();
         config.ipc.token = Some(token.into());
         config.service.home_dir = root.to_path_buf();
@@ -3537,6 +3549,7 @@ mod tests {
             &BTreeMap::new(),
             runtime_client.clone(),
         )
+        .await
         .expect("core");
         ServiceRuntimeInner {
             config,

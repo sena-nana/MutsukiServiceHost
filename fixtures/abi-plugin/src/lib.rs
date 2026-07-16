@@ -36,6 +36,10 @@ impl Runner for EchoRunner {
         &self.descriptor
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the public Runner contract preserves the structured RuntimeError unchanged"
+    )]
     fn run_batch(
         &mut self,
         _ctx: RunnerContext,
