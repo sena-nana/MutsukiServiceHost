@@ -131,3 +131,51 @@ async fn real_cdylib_loads_runner_and_resource_provider() {
         TaskStatus::Completed
     );
 }
+
+#[tokio::test]
+async fn real_cdylib_keeps_manifest_selected_abi_v1_compatibility() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("fixtures")
+        .join("abi-plugin");
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "--manifest-path"])
+        .arg(fixture_root.join("Cargo.toml"))
+        .status()
+        .expect("build ABI fixture");
+    assert!(status.success());
+    let file_name = if cfg!(target_os = "windows") {
+        "mutsuki_service_abi_fixture.dll"
+    } else if cfg!(target_os = "macos") {
+        "libmutsuki_service_abi_fixture.dylib"
+    } else {
+        "libmutsuki_service_abi_fixture.so"
+    };
+    let artifact = fixture_root
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("debug")
+        .join(file_name);
+    let sha256 = format!("sha256:{:x}", Sha256::digest(fs::read(&artifact).unwrap()));
+    let manifest = mutsuki_service_abi_fixture::fixture_manifest_v1(file_name, &sha256);
+    let root = tempdir().unwrap();
+    let mut config = ServiceConfig::default();
+    config.service.run_dir = root.path().join("run");
+    let plugin = load_abi_plugin(
+        PluginRecord {
+            manifest_path: root.path().join("plugin.toml"),
+            manifest,
+            runtime: None,
+            resolved_artifact: Some(artifact),
+        },
+        config,
+        Arc::new(DeferredRuntimeClient::default()),
+        json!({"fixture": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plugin.runners.len(), 1);
+    assert_eq!(plugin.resource_providers.len(), 1);
+}

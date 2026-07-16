@@ -7,8 +7,9 @@ use mutsuki_runtime_contracts::{
     RunnerDescriptor, SnapshotDescriptor, StreamPlan, WritePlan,
 };
 use mutsuki_runtime_core::{Runner, RunnerContext, RuntimeFailure, RuntimeResult};
+use mutsuki_runtime_sdk::abi::{ABI_BRIDGE_ID, ABI_CODEC_ID, ABI_TRANSPORT_VERSION};
 use mutsuki_runtime_sdk::{
-    AbiHostClient, PluginBuilder, ResourcePlanGateway, ResourceProviderGateway,
+    AbiHostClient, AbiHostClientV2, PluginBuilder, ResourcePlanGateway, ResourceProviderGateway,
     RunnerDescriptorBuilder, map_work_batch_entries,
 };
 use serde_json::{Value, json};
@@ -121,12 +122,30 @@ impl ResourceProviderGateway for FixtureProvider {
 }
 
 pub fn fixture_manifest(path: &str, sha256: &str) -> PluginManifest {
-    build_plugin(path, sha256).manifest
+    build_plugin(path, sha256, AbiVersion::V2).manifest
+}
+
+pub fn fixture_manifest_v1(path: &str, sha256: &str) -> PluginManifest {
+    build_plugin(path, sha256, AbiVersion::V1).manifest
+}
+
+fn create_plugin_v1(
+    _host: AbiHostClient,
+    config: Value,
+) -> RuntimeResult<mutsuki_runtime_sdk::LoadedPlugin> {
+    create_plugin(config, AbiVersion::V1)
+}
+
+fn create_plugin_v2(
+    _host: AbiHostClientV2,
+    config: Value,
+) -> RuntimeResult<mutsuki_runtime_sdk::LoadedPlugin> {
+    create_plugin(config, AbiVersion::V2)
 }
 
 fn create_plugin(
-    _host: AbiHostClient,
     config: Value,
+    version: AbiVersion,
 ) -> RuntimeResult<mutsuki_runtime_sdk::LoadedPlugin> {
     if config.get("fixture").and_then(Value::as_bool) != Some(true) {
         return Err(RuntimeFailure::new(
@@ -137,11 +156,21 @@ fn create_plugin(
             ),
         ));
     }
-    Ok(build_plugin("fixture", "sha256:fixture"))
+    Ok(build_plugin("fixture", "sha256:fixture", version))
 }
 
-fn build_plugin(path: &str, sha256: &str) -> mutsuki_runtime_sdk::LoadedPlugin {
-    PluginBuilder::new(PLUGIN_ID)
+#[derive(Clone, Copy)]
+enum AbiVersion {
+    V1,
+    V2,
+}
+
+fn build_plugin(
+    path: &str,
+    sha256: &str,
+    version: AbiVersion,
+) -> mutsuki_runtime_sdk::LoadedPlugin {
+    let mut plugin = PluginBuilder::new(PLUGIN_ID)
         .runner(Box::new(EchoRunner::new()))
         .resource_provider_gateway(PROVIDER_ID, Arc::new(FixtureProvider))
         .artifact(PluginArtifact {
@@ -149,7 +178,17 @@ fn build_plugin(path: &str, sha256: &str) -> mutsuki_runtime_sdk::LoadedPlugin {
             path: path.into(),
             sha256: sha256.into(),
         })
-        .build()
+        .build();
+    if matches!(version, AbiVersion::V1) {
+        plugin.manifest.provides.plugin_backends[0].codec_id = Some(ABI_CODEC_ID.into());
+        plugin.manifest.provides.plugin_backends[0].bridge_id = Some(ABI_BRIDGE_ID.into());
+        plugin.manifest.provides.codecs[0].codec_id = ABI_CODEC_ID.into();
+        plugin.manifest.provides.codecs[0].media_type = "application/x-ndjson".into();
+        plugin.manifest.provides.codecs[0].version = ABI_TRANSPORT_VERSION.to_string();
+        plugin.manifest.provides.bridges[0].bridge_id = ABI_BRIDGE_ID.into();
+        plugin.manifest.provides.bridges[0].codec_ids = vec![ABI_CODEC_ID.into()];
+    }
+    plugin
 }
 
 fn resource_ref(kind_id: &str, schema: &str, size: u64) -> ResourceRef {
@@ -196,4 +235,5 @@ fn unsupported(route: &str) -> RuntimeFailure {
     ))
 }
 
-mutsuki_runtime_sdk::export_mutsuki_plugin_abi_v1!(create_plugin);
+mutsuki_runtime_sdk::export_mutsuki_plugin_abi_v1!(create_plugin_v1);
+mutsuki_runtime_sdk::export_mutsuki_plugin_abi_v2!(create_plugin_v2);

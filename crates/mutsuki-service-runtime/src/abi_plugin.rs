@@ -4,11 +4,9 @@ mod staging;
 
 use std::sync::Arc;
 
-use mutsuki_runtime_host::{
-    TransportJsonlRunner, TransportResourceProvider, TypedRequestTransport,
-};
+use mutsuki_runtime_host::{TransportResourceProvider, TransportRunner};
 use mutsuki_runtime_sdk::{LoadedPlugin, RuntimeBootstrapperResourceProvider};
-use mutsuki_runtime_wire::{InitializeRequest, InitializedPlugin, ProtocolHello};
+use mutsuki_runtime_wire::InitializedPlugin;
 use mutsuki_service_config::ServiceConfig;
 use mutsuki_service_plugin_loader::PluginRecord;
 use serde_json::Value;
@@ -49,13 +47,10 @@ fn load_abi_plugin_blocking(
                 detail: "validated artifact path is missing".into(),
             })?;
     let staged = stage_artifact(&config, &record, source)?;
-    let connection = open_connection(&record.manifest.plugin_id, &staged, runtime)?;
-    let hello = ProtocolHello::debug_jsonl();
+    let connection = open_connection(&record.manifest, &staged, runtime)?;
+    let hello = connection.hello();
     let ack = connection
-        .request(&InitializeRequest {
-            hello: hello.clone(),
-            config: Some(plugin_config),
-        })
+        .initialize(Some(plugin_config))
         .map_err(ServiceRuntimeError::Core)?;
     ack.validate_for(&hello)
         .map_err(|error| ServiceRuntimeError::AbiPlugin {
@@ -75,7 +70,7 @@ fn load_abi_plugin_blocking(
         .iter()
         .cloned()
         .map(|descriptor| {
-            Box::new(TransportJsonlRunner::new(descriptor, connection.clone()))
+            Box::new(TransportRunner::new(descriptor, connection.clone()))
                 as Box<dyn mutsuki_runtime_core::Runner>
         })
         .collect();
