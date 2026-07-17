@@ -1,0 +1,67 @@
+name: performance-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "11 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  contract-smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        os: [macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run actual deployment matrix
+        shell: bash
+        run: >-
+          python crates/mutsuki-service-benchmarks/scripts/run-reference.py
+          --mode smoke --warmup 0 --samples 1
+          --output target/mutsuki-benchmarks/service-host-smoke.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-host-smoke-${{ matrix.os }}
+          path: target/mutsuki-benchmarks/service-host-smoke*.json
+
+  baseline-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Public runners verify correctness only; fixed reference runners and explicit approval own baselines."
+
+  fixed-reference:
+    name: Fixed reference (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            labels: [self-hosted, mutsuki-reference, macOS, ARM64]
+          - name: windows-x64
+            labels: [self-hosted, mutsuki-reference, Windows, X64]
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Run owner reference
+        shell: bash
+        run: >-
+          python crates/mutsuki-service-benchmarks/scripts/run-reference.py
+          --mode reference
+          --output artifacts/performance/reference-${{ matrix.name }}/report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-host-reference-${{ matrix.name }}-${{ github.run_id }}
+          path: artifacts/performance/reference-${{ matrix.name }}/
+          retention-days: 90
+          if-no-files-found: error

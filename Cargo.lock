@@ -557,6 +557,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mutsuki-service-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "cpu-time",
+ "mutsuki-runtime-contracts",
+ "mutsuki-runtime-core",
+ "mutsuki-runtime-sdk",
+ "mutsuki-runtime-wire",
+ "mutsuki-service-abi-fixture",
+ "mutsuki-service-config",
+ "mutsuki-service-control",
+ "mutsuki-service-ipc",
+ "mutsuki-service-plugin-loader",
+ "mutsuki-service-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "mutsuki-service-config"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/mutsuki-service-observe",
     "crates/mutsuki-service-daemon",
     "crates/mutsuki-service-runtime",
+    "crates/mutsuki-service-benchmarks",
     "crates/mutsuki-service-host",
     "fixtures/abi-plugin",
 ]
@@ -52,3 +53,4 @@ mutsuki-service-ipc = { path = "crates/mutsuki-service-ipc" }
 mutsuki-service-observe = { path = "crates/mutsuki-service-observe" }
 mutsuki-service-daemon = { path = "crates/mutsuki-service-daemon" }
 mutsuki-service-runtime = { path = "crates/mutsuki-service-runtime" }
+mutsuki-service-benchmarks = { path = "crates/mutsuki-service-benchmarks" }

@@ -1,0 +1,38 @@
+[package]
+name = "mutsuki-service-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+default-run = "mutsuki-service-benchmarks"
+
+[dependencies]
+cpu-time.workspace = true
+mutsuki-runtime-contracts.workspace = true
+mutsuki-runtime-core.workspace = true
+mutsuki-runtime-sdk.workspace = true
+mutsuki-runtime-wire.workspace = true
+mutsuki-service-abi-fixture = { path = "../../fixtures/abi-plugin" }
+mutsuki-service-config.workspace = true
+mutsuki-service-control.workspace = true
+mutsuki-service-ipc.workspace = true
+mutsuki-service-plugin-loader.workspace = true
+mutsuki-service-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[[bin]]
+name = "mutsuki-service-benchmarks"
+path = "src/main.rs"
+
+[[bin]]
+name = "mutsuki-benchmark-runner"
+path = "src/bin/benchmark_runner.rs"
+
+[[bin]]
+name = "mutsuki-benchmark-service"
+path = "src/bin/benchmark_service.rs"

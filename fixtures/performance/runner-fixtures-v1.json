@@ -1,0 +1,12 @@
+{
+  "schema_version": "mutsuki.performance.runner-fixtures/v1",
+  "seed": 1297435713,
+  "fixtures": [
+    {"protocol_id": "runner.noop", "payload": {}, "output": {"status": "ok"}, "output_sha256": "a29ee2b15c494311c52521766e44af56a3ad2248e7a8ab465e5206463c13d288"},
+    {"protocol_id": "runner.echo", "payload": {"message": "mutsuki", "sequence": 1}, "output": {"echo": {"message": "mutsuki", "sequence": 1}}, "output_sha256": "e410c601945ccfb5b6f145d04ad4e2c8ae402ab6f96119acba08ba33349d67b3"},
+    {"protocol_id": "runner.calibrated-cpu", "payload": {"seed": 1297435713, "iterations": 4096}, "output": {"checksum": "8daeb4710bda7ecb"}, "output_sha256": "d00c4479495f9674a196afc72e0d513dfa1038d0cae4bfa6b14064a80e84b20c"},
+    {"protocol_id": "runner.wait", "payload": {"wake_key": "fixture-wake"}, "output": {"resumed": true}, "output_sha256": "b15a267dbb404718d561a37e5662bc317b3f3d4f5fb43fc1d9bfd2188558240e"},
+    {"protocol_id": "runner.resource", "payload": {"resource_ref": "fixture-resource", "version": 1}, "output": {"resource_id": "fixture-resource", "version": 1}, "output_sha256": "c819f6e1d0cc9e1512fe2066d22bb5f95a05b7271f04132f096ea7cafc49f952"},
+    {"protocol_id": "runner.fault", "payload": {"fault": "error"}, "output": {"error": {"code": "fixture.failure", "retryable": false}}, "output_sha256": "58c4ed50020899153b0f6310b408d3bdb475387a226038d60a6ff3029347bb0d"}
+  ]
+}

@@ -15,24 +15,37 @@ use mutsuki_runtime_sdk::{
 use serde_json::{Value, json};
 
 const PLUGIN_ID: &str = "mutsuki.test.abi-fixture";
-const RUNNER_ID: &str = "mutsuki.test.abi-fixture.echo";
+const RUNNER_ID: &str = "mutsuki.test.abi-fixture.runner";
 const PROVIDER_ID: &str = "mutsuki.test.abi-fixture.resource";
+const LEGACY_ECHO_PROTOCOL: &str = "mutsuki.test.abi.echo";
+const FIXTURE_PROTOCOLS: [&str; 7] = [
+    LEGACY_ECHO_PROTOCOL,
+    "runner.noop",
+    "runner.echo",
+    "runner.calibrated-cpu",
+    "runner.wait",
+    "runner.resource",
+    "runner.fault",
+];
 
-struct EchoRunner {
+struct FixtureRunner {
     descriptor: RunnerDescriptor,
 }
 
-impl EchoRunner {
+impl FixtureRunner {
     fn new() -> Self {
-        Self {
-            descriptor: RunnerDescriptorBuilder::new(RUNNER_ID, PLUGIN_ID)
-                .accepted_protocol("mutsuki.test.abi.echo")
-                .build(),
-        }
+        let mut descriptor = RunnerDescriptorBuilder::new(RUNNER_ID, PLUGIN_ID)
+            .accepted_protocol(FIXTURE_PROTOCOLS[0])
+            .build();
+        descriptor.accepted_protocol_ids = FIXTURE_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_string())
+            .collect();
+        Self { descriptor }
     }
 }
 
-impl Runner for EchoRunner {
+impl Runner for FixtureRunner {
     fn descriptor(&self) -> &RunnerDescriptor {
         &self.descriptor
     }
@@ -46,11 +59,7 @@ impl Runner for EchoRunner {
         _ctx: RunnerContext,
         batch: mutsuki_runtime_contracts::WorkBatch,
     ) -> RuntimeResult<mutsuki_runtime_contracts::CompletionBatch> {
-        map_work_batch_entries(&batch, |task| {
-            Ok(mutsuki_runtime_contracts::RunnerResult::completed(
-                task.task_id.clone(),
-            ))
-        })
+        map_work_batch_entries(&batch, fixture_result)
     }
 }
 
@@ -122,11 +131,15 @@ impl ResourceProviderGateway for FixtureProvider {
 }
 
 pub fn fixture_manifest(path: &str, sha256: &str) -> PluginManifest {
-    build_plugin(path, sha256, AbiVersion::V2).manifest
+    build_plugin(path, sha256, AbiVersion::V2, true).manifest
 }
 
 pub fn fixture_manifest_v1(path: &str, sha256: &str) -> PluginManifest {
-    build_plugin(path, sha256, AbiVersion::V1).manifest
+    build_plugin(path, sha256, AbiVersion::V1, true).manifest
+}
+
+pub fn benchmark_manifest(path: &str, sha256: &str) -> PluginManifest {
+    build_plugin(path, sha256, AbiVersion::V2, false).manifest
 }
 
 fn create_plugin_v1(
@@ -156,7 +169,14 @@ fn create_plugin(
             ),
         ));
     }
-    Ok(build_plugin("fixture", "sha256:fixture", version))
+    let include_provider =
+        config.get("benchmark_runner_only").and_then(Value::as_bool) != Some(true);
+    Ok(build_plugin(
+        "fixture",
+        "sha256:fixture",
+        version,
+        include_provider,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -169,16 +189,19 @@ fn build_plugin(
     path: &str,
     sha256: &str,
     version: AbiVersion,
+    include_provider: bool,
 ) -> mutsuki_runtime_sdk::LoadedPlugin {
-    let mut plugin = PluginBuilder::new(PLUGIN_ID)
-        .runner(Box::new(EchoRunner::new()))
-        .resource_provider_gateway(PROVIDER_ID, Arc::new(FixtureProvider))
+    let mut builder = PluginBuilder::new(PLUGIN_ID)
+        .runner(Box::new(FixtureRunner::new()))
         .artifact(PluginArtifact {
             artifact_type: mutsuki_runtime_contracts::ArtifactType::Abi,
             path: path.into(),
             sha256: sha256.into(),
-        })
-        .build();
+        });
+    if include_provider {
+        builder = builder.resource_provider_gateway(PROVIDER_ID, Arc::new(FixtureProvider));
+    }
+    let mut plugin = builder.build();
     if matches!(version, AbiVersion::V1) {
         plugin.manifest.provides.plugin_backends[0].codec_id = Some(ABI_CODEC_ID.into());
         plugin.manifest.provides.plugin_backends[0].bridge_id = Some(ABI_BRIDGE_ID.into());
@@ -189,6 +212,66 @@ fn build_plugin(
         plugin.manifest.provides.bridges[0].codec_ids = vec![ABI_CODEC_ID.into()];
     }
     plugin
+}
+
+fn fixture_result(
+    task: &mutsuki_runtime_contracts::Task,
+) -> Result<mutsuki_runtime_contracts::RunnerResult, mutsuki_runtime_contracts::RuntimeError> {
+    if task.protocol_id == LEGACY_ECHO_PROTOCOL {
+        return Ok(mutsuki_runtime_contracts::RunnerResult::completed(
+            task.task_id.clone(),
+        ));
+    }
+    let output = match task.protocol_id.as_str() {
+        "runner.noop" => json!({"status": "ok"}),
+        "runner.echo" => json!({"echo": task.payload}),
+        "runner.calibrated-cpu" => {
+            let seed = task
+                .payload
+                .get("seed")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_297_435_713);
+            let iterations = task
+                .payload
+                .get("iterations")
+                .and_then(Value::as_u64)
+                .unwrap_or(4_096);
+            json!({"checksum": calibrated_checksum(seed, iterations)})
+        }
+        "runner.wait" => json!({"resumed": true}),
+        "runner.resource" => json!({
+            "resource_id": task.payload.get("resource_ref").cloned().unwrap_or(Value::Null),
+            "version": task.payload.get("version").cloned().unwrap_or(Value::Null),
+        }),
+        "runner.fault" => {
+            return Err(mutsuki_runtime_contracts::RuntimeError::new(
+                "fixture.failure",
+                PLUGIN_ID,
+                "fixture.requested_failure",
+            ));
+        }
+        protocol => {
+            return Err(mutsuki_runtime_contracts::RuntimeError::new(
+                mutsuki_runtime_contracts::ERR_RUNTIME_HOST_FAILED,
+                PLUGIN_ID,
+                format!("fixture.unsupported_protocol.{protocol}"),
+            ));
+        }
+    };
+    let mut result = mutsuki_runtime_contracts::RunnerResult::completed(task.task_id.clone());
+    result.output = Some(output);
+    Ok(result)
+}
+
+fn calibrated_checksum(seed: u64, iterations: u64) -> String {
+    let mut value = seed;
+    for _ in 0..iterations {
+        value = value
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        value ^= value >> 33;
+    }
+    format!("{value:016x}")
 }
 
 fn resource_ref(kind_id: &str, schema: &str, size: u64) -> ResourceRef {

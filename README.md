@@ -134,6 +134,12 @@ security isolation should use the process/Python deployment instead.
 ServiceHost does not link development, conversation, or UI plugins. Product binaries may register
 real builtin crates through `ServiceRuntimeBuilder`; missing upstream capabilities remain unavailable.
 
+## Performance
+
+The versioned ServiceHost benchmark matrix exercises real builtin, ABI, and independent Rust JSONL
+Runner deployments through authenticated IPC, reload, and graceful shutdown. See
+[`docs/performance-model-v1.md`](docs/performance-model-v1.md) for smoke and local reference commands.
+
 ## Validation
 
 ```powershell
