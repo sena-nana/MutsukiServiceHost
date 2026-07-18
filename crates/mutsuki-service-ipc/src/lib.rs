@@ -211,25 +211,27 @@ async fn start_named_pipe_server(
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let path = named_pipe_path(&name);
+    let first_server = ServerOptions::new().create(&path)?;
     let handle = tokio::spawn(async move {
+        let mut server = first_server;
         loop {
-            let server = match ServerOptions::new().create(&path) {
+            if let Err(error) = server.connect().await {
+                tracing::warn!(error = %error, pipe = %path, "named pipe connect failed");
+            } else {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_stream(server, handler).await {
+                        tracing::warn!(error = %error, "named pipe request failed");
+                    }
+                });
+            }
+            server = match ServerOptions::new().create(&path) {
                 Ok(server) => server,
                 Err(error) => {
                     tracing::error!(error = %error, pipe = %path, "failed to create named pipe");
                     break;
                 }
             };
-            if let Err(error) = server.connect().await {
-                tracing::warn!(error = %error, pipe = %path, "named pipe connect failed");
-                continue;
-            }
-            let handler = handler.clone();
-            tokio::spawn(async move {
-                if let Err(error) = serve_stream(server, handler).await {
-                    tracing::warn!(error = %error, "named pipe request failed");
-                }
-            });
         }
     });
     Ok(handle)
@@ -403,5 +405,27 @@ mod tests {
         assert!(endpoint.exists());
         server.shutdown().await;
         assert!(!endpoint.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_server_is_ready_when_start_returns() {
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = true;
+        config.ipc.transport = IpcTransport::NamedPipe;
+        config.ipc.name = format!("mutsuki-ipc-ready-{}", std::process::id());
+        config.ipc.token = Some("test-token".into());
+
+        let server = start_server(&config, Arc::new(OkHandler))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = ControlClient::new((&config).into())
+            .request(ControlMethod::HealthCheck, Value::Null)
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        server.shutdown().await;
     }
 }
