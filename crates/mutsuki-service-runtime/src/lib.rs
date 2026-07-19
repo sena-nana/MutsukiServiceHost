@@ -14,12 +14,15 @@ use mutsuki_runtime_contracts::{
     ResourceRef, RuntimeProfile, RuntimeProfileMode, SnapshotDescriptor, StreamPlan,
     SurfaceCompatibility, TaskBatch, TaskHandle, TaskOutcome, TaskStatus, WritePlan,
 };
-use mutsuki_runtime_core::{Runner, RuntimeFailure, RuntimeResult, RuntimeStopState};
+use mutsuki_runtime_core::{
+    AsyncBatchHandler, Runner, RuntimeFailure, RuntimeResult, RuntimeStopState,
+};
 #[cfg(test)]
 use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
-    ProcessRunnerSpec, RunnerLimits, RuntimeBootstrapper, SpawnedJsonlRunner, resolve_load_plan,
+    ProcessRunnerSpec, RunnerLimits, RuntimeBootstrapper, SpawnedJsonlRunner, TokioAsyncExecutor,
+    resolve_load_plan,
 };
 use mutsuki_runtime_sdk::{
     LoadedPlugin, ResourcePlanGateway, ResourceRegistryGateway, RuntimeClient, RuntimeClientRef,
@@ -62,6 +65,8 @@ pub use event_source::{
 };
 
 type NativeRunnerFactory = Arc<dyn Fn() -> Result<Box<dyn Runner>, String> + Send + Sync>;
+type AsyncHandlerFactory =
+    Arc<dyn Fn() -> Result<Arc<dyn AsyncBatchHandler>, String> + Send + Sync>;
 type LoadedPluginFactory = Arc<dyn Fn() -> Result<LoadedPlugin, String> + Send + Sync>;
 type HealthProbe = Arc<dyn Fn() -> Value + Send + Sync>;
 
@@ -330,6 +335,7 @@ pub struct ServiceRuntimeBuilder {
     configured_plugins: ConfiguredPluginCatalog,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    async_handler_factories: Vec<AsyncHandlerFactory>,
     loaded_plugin_factories: BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
     health_probes: BTreeMap<String, HealthProbe>,
@@ -406,6 +412,7 @@ struct ServiceRuntimeInner {
     event_sources: EventSourceSupervisor,
     builtin_registry: BuiltinRegistry,
     native_runner_factories: Vec<NativeRunnerFactory>,
+    async_handler_factories: Vec<AsyncHandlerFactory>,
     loaded_plugin_factories: BTreeMap<String, LoadedPluginFactory>,
     health_probes: BTreeMap<String, HealthProbe>,
     runtime_client: Arc<DeferredRuntimeClient>,
@@ -435,6 +442,7 @@ impl ServiceRuntimeBuilder {
             configured_plugins: ConfiguredPluginCatalog::new(),
             builtin_registry: builtin_registry(),
             native_runner_factories: Vec::new(),
+            async_handler_factories: Vec::new(),
             loaded_plugin_factories: BTreeMap::new(),
             runtime_client: Arc::new(DeferredRuntimeClient::default()),
             health_probes: BTreeMap::new(),
@@ -489,6 +497,28 @@ impl ServiceRuntimeBuilder {
         E: std::fmt::Display,
     {
         self.native_runner_factories.push(Arc::new(move || {
+            factory().map_err(|error| error.to_string())
+        }));
+        self
+    }
+
+    /// Registers a recreatable Host-driven async handler for boot and reload.
+    pub fn register_builtin_async_handler<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Arc<dyn AsyncBatchHandler> + Send + Sync + 'static,
+    {
+        self.async_handler_factories
+            .push(Arc::new(move || Ok(factory())));
+        self
+    }
+
+    /// Registers a fallible Host-driven async handler factory for boot and reload.
+    pub fn register_fallible_builtin_async_handler<F, E>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Result<Arc<dyn AsyncBatchHandler>, E> + Send + Sync + 'static,
+        E: std::fmt::Display,
+    {
+        self.async_handler_factories.push(Arc::new(move || {
             factory().map_err(|error| error.to_string())
         }));
         self
@@ -577,6 +607,7 @@ impl ServiceRuntimeBuilder {
             configured_plugins: _,
             builtin_registry,
             native_runner_factories,
+            async_handler_factories,
             loaded_plugin_factories,
             runtime_client,
             health_probes,
@@ -593,6 +624,7 @@ impl ServiceRuntimeBuilder {
             &config,
             &catalog,
             &native_runner_factories,
+            &async_handler_factories,
             &loaded_plugin_factories,
             runtime_client.clone(),
         )
@@ -612,6 +644,7 @@ impl ServiceRuntimeBuilder {
             event_sources: event_source_supervisor.clone(),
             builtin_registry,
             native_runner_factories,
+            async_handler_factories,
             loaded_plugin_factories,
             health_probes,
             runtime_client,
@@ -784,12 +817,17 @@ impl ServiceRuntime {
         let graceful = Duration::from_millis(self.inner.config.runners.graceful_shutdown_ms);
         self.inner.event_sources.shutdown(graceful).await;
         self.inner.supervisor.shutdown(graceful).await;
-        let _ = self
+        let host_runtime = self
             .inner
             .host_runtime
             .lock()
             .expect("host runtime mutex")
             .take();
+        if let Some(host_runtime) = host_runtime {
+            // Tokio runtimes perform a blocking shutdown when dropped. ServiceRuntime itself is
+            // async, so release the Host-owned executor outside the caller's async context.
+            let _ = tokio::task::spawn_blocking(move || drop(host_runtime)).await;
+        }
     }
 }
 
@@ -1072,6 +1110,7 @@ impl ServiceRuntimeInner {
             &self.config,
             &new_catalog,
             &self.native_runner_factories,
+            &self.async_handler_factories,
             &self.loaded_plugin_factories,
             self.runtime_client.clone(),
         )
@@ -1646,6 +1685,7 @@ async fn boot_core(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    async_handler_factories: &[AsyncHandlerFactory],
     loaded_plugin_factories: &BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<HostRuntime> {
@@ -1653,6 +1693,7 @@ async fn boot_core(
         config,
         catalog,
         native_runner_factories,
+        async_handler_factories,
         loaded_plugin_factories,
         runtime_client,
     )
@@ -1695,6 +1736,12 @@ async fn boot_core(
             .core
             .worker_health_timeout_ms
             .map(Duration::from_millis),
+        async_executor: Some(Arc::new(TokioAsyncExecutor::new(
+            worker_settings.compute_threads.clamp(1, 4),
+            worker_settings.queue_capacity,
+            worker_settings.queue_capacity,
+            worker_settings.max_inflight_bytes,
+        )?)),
         ..HostRuntimeConfig::default()
     };
     let lock = resolve_load_plan(
@@ -1745,6 +1792,7 @@ async fn runtime_bootstrapper(
     config: &ServiceConfig,
     catalog: &PluginCatalog,
     native_runner_factories: &[NativeRunnerFactory],
+    async_handler_factories: &[AsyncHandlerFactory],
     loaded_plugin_factories: &BTreeMap<String, LoadedPluginFactory>,
     runtime_client: Arc<DeferredRuntimeClient>,
 ) -> ServiceRuntimeResult<(RuntimeBootstrapper, RuntimeProfile)> {
@@ -1796,6 +1844,13 @@ async fn runtime_bootstrapper(
         let plugin_id = &runner.descriptor().plugin_id;
         if deployments.get(plugin_id) == Some(&PluginDeploymentKind::Builtin) {
             bootstrapper.register_builtin_runner(runner);
+        }
+    }
+    for factory in async_handler_factories {
+        let handler = factory().map_err(ServiceRuntimeError::NativeRunnerFactory)?;
+        let plugin_id = &handler.descriptor().plugin_id;
+        if deployments.get(plugin_id) == Some(&PluginDeploymentKind::Builtin) {
+            bootstrapper.register_async_handler(handler);
         }
     }
     Ok((
@@ -2156,6 +2211,31 @@ mod tests {
 
     struct SecondConfiguredFactory;
 
+    struct DelayedAsyncHandler {
+        descriptor: RunnerDescriptor,
+    }
+
+    impl AsyncBatchHandler for DelayedAsyncHandler {
+        fn descriptor(&self) -> &RunnerDescriptor {
+            &self.descriptor
+        }
+
+        fn run_batch(
+            &self,
+            _ctx: mutsuki_runtime_contracts::RunnerContext,
+            batch: WorkBatch,
+        ) -> mutsuki_runtime_core::AsyncCompletionFuture {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                map_work_batch_entries(&batch, |task| {
+                    Ok(mutsuki_runtime_contracts::RunnerResult::completed(
+                        &task.task_id,
+                    ))
+                })
+            })
+        }
+    }
+
     impl ConfiguredPluginFactory for TestConfiguredFactory {
         fn plugin_id(&self) -> &str {
             "test.configured"
@@ -2214,6 +2294,88 @@ mod tests {
             builder.builtin_registry.load_all().unwrap().records.len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn service_runtime_injects_executor_for_registered_async_handler() {
+        let dir = tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut config = ServiceConfig::default();
+        config.ipc.enabled = false;
+        config.observe.console = false;
+        config.service.home_dir = dir.path().to_path_buf();
+        config.service.data_dir = dir.path().join("data");
+        config.service.log_dir = dir.path().join("logs");
+        config.service.run_dir = dir.path().join("run");
+        config.plugins.dynamic_dirs.clear();
+        config.plugins.disabled_dir = dir.path().join("disabled");
+        config.plugins.configured = vec![configured_selection("test.async", Value::Null)];
+
+        let mut descriptor = chain_descriptor("test.async", "test.async.runner", "test.async.run");
+        descriptor.execution_class = ExecutionClass::Io;
+        descriptor.invocation_mode = mutsuki_runtime_contracts::InvocationMode::AsyncReentrant;
+        descriptor.concurrency = mutsuki_runtime_contracts::RunnerConcurrency::Reentrant {
+            max_inflight_batches: 4,
+            max_inflight_entries: 4,
+        };
+        descriptor.batch.preferred_batch_size = 1;
+        descriptor.batch.max_batch_entries = 1;
+        descriptor.batch.max_entry_concurrency = 1;
+        descriptor.batch.max_inflight_batches = 4;
+        let factory_descriptor = descriptor.clone();
+        let runtime = ServiceRuntimeBuilder::new(config)
+            .register_builtin_plugin(runner_manifest("test.async", descriptor))
+            .register_builtin_async_handler(move || {
+                Arc::new(DelayedAsyncHandler {
+                    descriptor: factory_descriptor.clone(),
+                })
+            })
+            .start()
+            .await
+            .expect("async runtime starts");
+
+        runtime
+            .inner
+            .host_runtime
+            .lock()
+            .expect("runtime mutex")
+            .as_ref()
+            .expect("runtime")
+            .dispatch(HostRuntimeCommand::SubmitTask(Box::new(Task::new(
+                "async-task",
+                "test.async.run",
+                json!({}),
+            ))))
+            .expect("task submitted");
+
+        for _ in 0..100 {
+            let completed = runtime
+                .inner
+                .host_runtime
+                .lock()
+                .expect("runtime mutex")
+                .as_ref()
+                .expect("runtime")
+                .task_snapshots()
+                .expect("snapshots")
+                .iter()
+                .any(|task| task.task_id == "async-task" && task.status == TaskStatus::Completed);
+            if completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let host = runtime.inner.host_runtime.lock().expect("runtime mutex");
+            let host = host.as_ref().expect("runtime");
+            assert!(
+                host.task_snapshots().unwrap().iter().any(
+                    |task| task.task_id == "async-task" && task.status == TaskStatus::Completed
+                )
+            );
+            assert!(host.async_executor().unwrap().is_some());
+        }
+        runtime.shutdown().await;
     }
 
     #[test]
@@ -3552,6 +3714,7 @@ mod tests {
             &config,
             &catalog,
             &[],
+            &[],
             &BTreeMap::new(),
             runtime_client.clone(),
         )
@@ -3566,6 +3729,7 @@ mod tests {
             event_sources: EventSourceSupervisor::default(),
             builtin_registry: registry,
             native_runner_factories: Vec::new(),
+            async_handler_factories: Vec::new(),
             loaded_plugin_factories: BTreeMap::new(),
             health_probes: BTreeMap::new(),
             runtime_client,
