@@ -1,0 +1,590 @@
+{
+  "cases": [
+    {
+      "case_id": "service-host.abi.startup",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "abi",
+        "operation": "startup"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 12290300.0,
+          "max": 71646100.0,
+          "median": 56000300.0,
+          "min": 42137800.0,
+          "p95": 71646100.0,
+          "p99": 71646100.0,
+          "sample_count": 5,
+          "samples": [
+            42137800.0,
+            43710000.0,
+            56000300.0,
+            67480900.0,
+            71646100.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.abi.health-ipc",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "abi",
+        "operation": "health-ipc"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 2112400.0,
+          "max": 9218500.0,
+          "median": 2728500.0,
+          "min": 592700.0,
+          "p95": 9218500.0,
+          "p99": 9218500.0,
+          "sample_count": 5,
+          "samples": [
+            592700.0,
+            2376100.0,
+            2728500.0,
+            4840900.0,
+            9218500.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.abi.echo-e2e",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "abi",
+        "operation": "echo-e2e"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 3413200.0,
+          "max": 15816400.0,
+          "median": 7525000.0,
+          "min": 3944600.0,
+          "p95": 15816400.0,
+          "p99": 15816400.0,
+          "sample_count": 5,
+          "samples": [
+            3944600.0,
+            4111800.0,
+            7525000.0,
+            8621000.0,
+            15816400.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.abi.reload",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "abi",
+        "operation": "reload"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 307800.0,
+          "max": 18499700.0,
+          "median": 13532100.0,
+          "min": 12549400.0,
+          "p95": 18499700.0,
+          "p99": 18499700.0,
+          "sample_count": 5,
+          "samples": [
+            12549400.0,
+            13474900.0,
+            13532100.0,
+            13839900.0,
+            18499700.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.abi.shutdown",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "abi",
+        "operation": "shutdown"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 198600.0,
+          "max": 2580200.0,
+          "median": 1548900.0,
+          "min": 1092700.0,
+          "p95": 2580200.0,
+          "p99": 2580200.0,
+          "sample_count": 5,
+          "samples": [
+            1092700.0,
+            1466300.0,
+            1548900.0,
+            1747500.0,
+            2580200.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.builtin.startup",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "builtin",
+        "operation": "startup"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 1233700.0,
+          "max": 11492300.0,
+          "median": 10125900.0,
+          "min": 6984800.0,
+          "p95": 11492300.0,
+          "p99": 11492300.0,
+          "sample_count": 5,
+          "samples": [
+            6984800.0,
+            8892200.0,
+            10125900.0,
+            11137000.0,
+            11492300.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.builtin.health-ipc",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "builtin",
+        "operation": "health-ipc"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 19700.0,
+          "max": 583800.0,
+          "median": 564100.0,
+          "min": 411700.0,
+          "p95": 583800.0,
+          "p99": 583800.0,
+          "sample_count": 5,
+          "samples": [
+            411700.0,
+            499700.0,
+            564100.0,
+            574400.0,
+            583800.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.builtin.echo-e2e",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "builtin",
+        "operation": "echo-e2e"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 166900.0,
+          "max": 1467700.0,
+          "median": 1165100.0,
+          "min": 998200.0,
+          "p95": 1467700.0,
+          "p99": 1467700.0,
+          "sample_count": 5,
+          "samples": [
+            998200.0,
+            1088500.0,
+            1165100.0,
+            1392100.0,
+            1467700.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.builtin.reload",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "builtin",
+        "operation": "reload"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 701200.0,
+          "max": 7332300.0,
+          "median": 6224700.0,
+          "min": 5523500.0,
+          "p95": 7332300.0,
+          "p99": 7332300.0,
+          "sample_count": 5,
+          "samples": [
+            5523500.0,
+            6222800.0,
+            6224700.0,
+            7094700.0,
+            7332300.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.builtin.shutdown",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "builtin",
+        "operation": "shutdown"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 12400.0,
+          "max": 1077500.0,
+          "median": 935400.0,
+          "min": 870400.0,
+          "p95": 1077500.0,
+          "p99": 1077500.0,
+          "sample_count": 5,
+          "samples": [
+            870400.0,
+            923000.0,
+            935400.0,
+            938400.0,
+            1077500.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.rust-process-jsonl.startup",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "rust-process-jsonl",
+        "operation": "startup"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 14055500.0,
+          "max": 75286400.0,
+          "median": 56127700.0,
+          "min": 42072200.0,
+          "p95": 75286400.0,
+          "p99": 75286400.0,
+          "sample_count": 5,
+          "samples": [
+            42072200.0,
+            44586700.0,
+            56127700.0,
+            74507500.0,
+            75286400.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.rust-process-jsonl.health-ipc",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "rust-process-jsonl",
+        "operation": "health-ipc"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 10436100.0,
+          "max": 38741200.0,
+          "median": 12293300.0,
+          "min": 1857200.0,
+          "p95": 38741200.0,
+          "p99": 38741200.0,
+          "sample_count": 5,
+          "samples": [
+            1857200.0,
+            9056400.0,
+            12293300.0,
+            27123000.0,
+            38741200.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.rust-process-jsonl.echo-e2e",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "rust-process-jsonl",
+        "operation": "echo-e2e"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 36130100.0,
+          "max": 93884200.0,
+          "median": 49518900.0,
+          "min": 10359300.0,
+          "p95": 93884200.0,
+          "p99": 93884200.0,
+          "sample_count": 5,
+          "samples": [
+            10359300.0,
+            49413700.0,
+            49518900.0,
+            85649000.0,
+            93884200.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.rust-process-jsonl.reload",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "rust-process-jsonl",
+        "operation": "reload"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 12342600.0,
+          "max": 60532600.0,
+          "median": 46065100.0,
+          "min": 28185700.0,
+          "p95": 60532600.0,
+          "p99": 60532600.0,
+          "sample_count": 5,
+          "samples": [
+            28185700.0,
+            33722500.0,
+            46065100.0,
+            47621600.0,
+            60532600.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.rust-process-jsonl.shutdown",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "deployment": "rust-process-jsonl",
+        "operation": "shutdown"
+      },
+      "measurement_mode": "time",
+      "metrics": {
+        "latency_ns": {
+          "mad": 24680300.0,
+          "max": 118727000.0,
+          "median": 48283300.0,
+          "min": 23603000.0,
+          "p95": 118727000.0,
+          "p99": 118727000.0,
+          "sample_count": 5,
+          "samples": [
+            23603000.0,
+            45870700.0,
+            48283300.0,
+            104103100.0,
+            118727000.0
+          ],
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "case_id": "service-host.process-cpu",
+      "correctness": {
+        "counters": {},
+        "passed": true
+      },
+      "dimensions": {
+        "scope": "complete-suite"
+      },
+      "measurement_mode": "system",
+      "metrics": {
+        "cpu_time_ns": {
+          "mad": 0.0,
+          "max": 1046875000.0,
+          "median": 1046875000.0,
+          "min": 1046875000.0,
+          "p95": 1046875000.0,
+          "p99": 1046875000.0,
+          "sample_count": 1,
+          "samples": [
+            1046875000.0
+          ],
+          "unit": "ns"
+        }
+      }
+    }
+  ],
+  "correctness": {
+    "counters": {
+      "failures": 0
+    },
+    "passed": true
+  },
+  "deployment": "service-host-matrix",
+  "environment": {
+    "architecture": "x86_64",
+    "cpu_model": "unknown",
+    "cpu_topology": "logical=16",
+    "kernel": "unknown",
+    "os": "windows",
+    "power_mode": "local-unspecified",
+    "ram_bytes": 1,
+    "release_profile": {
+      "codegen_units": 16,
+      "lto": false,
+      "name": "release"
+    },
+    "runner_configuration": {
+      "ipc": "platform-default",
+      "mode": "reference",
+      "samples": 5,
+      "warmup": 1
+    },
+    "target_triple": "x86_64-pc-windows-msvc",
+    "toolchains": {
+      "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)",
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)"
+    },
+    "virtualization": "local-unspecified"
+  },
+  "environment_id": "c56f594e31cd5e7cd9227db8a49222d2bef18318d7abf8664a5407a84dbeaaee",
+  "feature_set": [
+    "actual-ipc",
+    "builtin",
+    "abi",
+    "rust-process-jsonl",
+    "lifecycle-reload"
+  ],
+  "gates": [
+    {
+      "actual": 0,
+      "gate_id": "service-host.correctness",
+      "limit": 0,
+      "passed": true,
+      "unit": "failures"
+    }
+  ],
+  "generated_at": "unknown",
+  "measurement_boundary": "ServiceRuntime start through authenticated IPC, Core task completion, reload and graceful shutdown",
+  "metadata": {
+    "case_count": 16,
+    "failures": [],
+    "fixture_checks": 18,
+    "fixture_output_hashes": {
+      "abi:runner.calibrated-cpu": "d00c4479495f9674a196afc72e0d513dfa1038d0cae4bfa6b14064a80e84b20c",
+      "abi:runner.echo": "e410c601945ccfb5b6f145d04ad4e2c8ae402ab6f96119acba08ba33349d67b3",
+      "abi:runner.fault": "58c4ed50020899153b0f6310b408d3bdb475387a226038d60a6ff3029347bb0d",
+      "abi:runner.noop": "a29ee2b15c494311c52521766e44af56a3ad2248e7a8ab465e5206463c13d288",
+      "abi:runner.resource": "c819f6e1d0cc9e1512fe2066d22bb5f95a05b7271f04132f096ea7cafc49f952",
+      "abi:runner.wait": "b15a267dbb404718d561a37e5662bc317b3f3d4f5fb43fc1d9bfd2188558240e",
+      "builtin:runner.calibrated-cpu": "d00c4479495f9674a196afc72e0d513dfa1038d0cae4bfa6b14064a80e84b20c",
+      "builtin:runner.echo": "e410c601945ccfb5b6f145d04ad4e2c8ae402ab6f96119acba08ba33349d67b3",
+      "builtin:runner.fault": "58c4ed50020899153b0f6310b408d3bdb475387a226038d60a6ff3029347bb0d",
+      "builtin:runner.noop": "a29ee2b15c494311c52521766e44af56a3ad2248e7a8ab465e5206463c13d288",
+      "builtin:runner.resource": "c819f6e1d0cc9e1512fe2066d22bb5f95a05b7271f04132f096ea7cafc49f952",
+      "builtin:runner.wait": "b15a267dbb404718d561a37e5662bc317b3f3d4f5fb43fc1d9bfd2188558240e",
+      "rust-process-jsonl:runner.calibrated-cpu": "d00c4479495f9674a196afc72e0d513dfa1038d0cae4bfa6b14064a80e84b20c",
+      "rust-process-jsonl:runner.echo": "e410c601945ccfb5b6f145d04ad4e2c8ae402ab6f96119acba08ba33349d67b3",
+      "rust-process-jsonl:runner.fault": "58c4ed50020899153b0f6310b408d3bdb475387a226038d60a6ff3029347bb0d",
+      "rust-process-jsonl:runner.noop": "a29ee2b15c494311c52521766e44af56a3ad2248e7a8ab465e5206463c13d288",
+      "rust-process-jsonl:runner.resource": "c819f6e1d0cc9e1512fe2066d22bb5f95a05b7271f04132f096ea7cafc49f952",
+      "rust-process-jsonl:runner.wait": "b15a267dbb404718d561a37e5662bc317b3f3d4f5fb43fc1d9bfd2188558240e"
+    },
+    "public_runner_gate": "correctness-only"
+  },
+  "report_id": "service-host-reference-36360",
+  "repository_revisions": {
+    "MutsukiServiceHost": {
+      "dirty": false,
+      "remote": "https://github.com/sena-nana/MutsukiServiceHost.git",
+      "revision": "5b58c61c7ef3e3461ce513c823e317bac6c4b8df"
+    }
+  },
+  "revision_lock_hash": "eb08569499860c709e0785d2017c4f27b7dea8f8997d2919cf6180fb0c120471",
+  "sampling": {
+    "process_runs": 1,
+    "samples_per_process": 5,
+    "warmup_iterations": 1
+  },
+  "schema_version": "mutsuki.performance.report/v1",
+  "suite_version": "service-host-performance/v1",
+  "workload_version": "runner-fixtures/v1"
+}

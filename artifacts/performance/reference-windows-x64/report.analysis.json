@@ -1,0 +1,18 @@
+{
+  "classification": "environmental-noise",
+  "noisy_cases": [
+    "service-host.abi.startup",
+    "service-host.abi.health-ipc",
+    "service-host.abi.echo-e2e",
+    "service-host.abi.shutdown",
+    "service-host.builtin.startup",
+    "service-host.builtin.echo-e2e",
+    "service-host.builtin.reload",
+    "service-host.rust-process-jsonl.startup",
+    "service-host.rust-process-jsonl.health-ipc",
+    "service-host.rust-process-jsonl.echo-e2e",
+    "service-host.rust-process-jsonl.reload",
+    "service-host.rust-process-jsonl.shutdown"
+  ],
+  "rule": "relative MAD above 5% is environmental noise unless correctness also failed"
+}
