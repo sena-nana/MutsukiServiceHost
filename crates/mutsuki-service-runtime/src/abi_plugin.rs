@@ -88,8 +88,10 @@ fn load_abi_plugin_blocking(
     Ok(LoadedPlugin {
         manifest: record.manifest,
         runners,
+        async_handlers: Vec::new(),
         host_services: Vec::new(),
         resource_providers,
+        async_resource_providers: Vec::new(),
     })
 }
 

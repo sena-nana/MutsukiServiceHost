@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
 use mutsuki_runtime_contracts::{
-    ExecutionClass, ObservabilityProfile, RunnerBatchCapability, RunnerControlCapability,
-    RunnerDescriptor, RunnerOrderingCapability, RunnerPayloadCapability, RunnerPurity,
-    RunnerResourceCapability, RunnerResult, RuntimeProfile, RuntimeProfileMode, Task, TaskStatus,
+    ExecutionClass, InvocationMode, ObservabilityProfile, RunnerBatchCapability, RunnerConcurrency,
+    RunnerControlCapability, RunnerDescriptor, RunnerOrderingCapability, RunnerPayloadCapability,
+    RunnerPurity, RunnerResourceCapability, RunnerResult, RuntimeProfile, RuntimeProfileMode, Task,
+    TaskStatus,
 };
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, NativeRunner, RuntimeBootstrapper,
@@ -25,6 +26,8 @@ fn descriptor() -> RunnerDescriptor {
         accepted_protocol_ids: vec![PROTOCOL_ID.into()],
         purity: RunnerPurity::Pure,
         execution_class: ExecutionClass::Cpu,
+        invocation_mode: InvocationMode::SyncExclusive,
+        concurrency: RunnerConcurrency::Exclusive,
         input_schema: json!({}),
         output_schema: json!({}),
         batch: RunnerBatchCapability::default(),
