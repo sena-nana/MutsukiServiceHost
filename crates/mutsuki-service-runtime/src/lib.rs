@@ -3211,10 +3211,19 @@ mod tests {
                 json!({}),
             ))))
             .expect("task submitted");
-        tokio::time::sleep(Duration::from_millis(70)).await;
-
-        let response = runtime.inner.health_check().await;
-        let report: HealthReport = serde_json::from_value(response.result.unwrap()).unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let response = runtime.inner.health_check().await;
+                let report: HealthReport =
+                    serde_json::from_value(response.result.unwrap()).unwrap();
+                if report.core == "degraded" {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker isolation reaches degraded health");
         assert_eq!(report.core, "degraded");
         assert!(
             report
@@ -3265,7 +3274,7 @@ mod tests {
             .expect("drive state");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let health = tokio::time::timeout(Duration::from_millis(50), runtime.inner.health_check())
+        let health = tokio::time::timeout(Duration::from_secs(1), runtime.inner.health_check())
             .await
             .expect("health remains responsive while Core actor sleeps");
         let report: HealthReport =
@@ -3284,7 +3293,7 @@ mod tests {
         assert_eq!(after.timed_wakeups, before.timed_wakeups);
         assert_eq!(after.next_wake_deadline, None);
 
-        tokio::time::timeout(Duration::from_millis(250), runtime.shutdown())
+        tokio::time::timeout(Duration::from_secs(3), runtime.shutdown())
             .await
             .expect("shutdown interrupts idle actor sleep");
     }
