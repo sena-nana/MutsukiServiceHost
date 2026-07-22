@@ -21,8 +21,8 @@ use mutsuki_runtime_core::{
 use mutsuki_runtime_host::JsonlRunner;
 use mutsuki_runtime_host::{
     HostRuntime, HostRuntimeCommand, HostRuntimeConfig, HostRuntimeReply, HostTaskSnapshot,
-    ProcessRunnerSpec, RunnerLimits, RuntimeBootstrapper, SpawnedJsonlRunner, TokioAsyncExecutor,
-    resolve_load_plan,
+    HostTaskState, ProcessRunnerSpec, RunnerLimits, RuntimeBootstrapper, SpawnedJsonlRunner,
+    TokioAsyncExecutor, resolve_load_plan,
 };
 use mutsuki_runtime_sdk::{
     LoadedPlugin, ResourcePlanGateway, ResourceRegistryGateway, RuntimeClient, RuntimeClientRef,
@@ -1393,23 +1393,11 @@ impl ServiceRuntimeInner {
                 .iter()
                 .all(|state| is_terminal_task_status(state.status.as_ref()));
             if all_terminal {
-                return ControlResponse::ok(TaskWaitResponse {
-                    outcomes: states
-                        .into_iter()
-                        .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
-                        .collect(),
-                    timed_out: false,
-                });
+                return task_wait_response(states, false);
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return ControlResponse::ok(TaskWaitResponse {
-                    outcomes: states
-                        .into_iter()
-                        .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
-                        .collect(),
-                    timed_out: true,
-                });
+                return task_wait_response(states, true);
             }
             match subscription.wait_after_timeout(revision, deadline.saturating_duration_since(now))
             {
@@ -1422,15 +1410,7 @@ impl ServiceRuntimeInner {
                         ));
                     };
                     return match runtime.task_states(handles) {
-                        Ok(states) => ControlResponse::ok(TaskWaitResponse {
-                            outcomes: states
-                                .into_iter()
-                                .map(|state| {
-                                    to_control_task_outcome(&state.handle.task_id, state.outcome)
-                                })
-                                .collect(),
-                            timed_out: true,
-                        }),
+                        Ok(states) => task_wait_response(states, true),
                         Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
                     };
                 }
@@ -2316,6 +2296,16 @@ fn is_terminal_task_status(status: Option<&TaskStatus>) -> bool {
                 | TaskStatus::DeadLetter
         )
     )
+}
+
+fn task_wait_response(states: Vec<HostTaskState>, timed_out: bool) -> ControlResponse {
+    ControlResponse::ok(TaskWaitResponse {
+        outcomes: states
+            .into_iter()
+            .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
+            .collect(),
+        timed_out,
+    })
 }
 
 fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {
