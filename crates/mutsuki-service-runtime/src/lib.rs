@@ -40,7 +40,8 @@ use mutsuki_service_control::{
     PluginInventoryDiagnostic, PluginListResponse, PluginReloadChange, PluginReloadResponse,
     PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus, TaskEventPage,
     TaskEventsAfterParam, TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
-    TaskSnapshot as ControlTaskSnapshot, TaskSubmitBatchParam, TaskSubmitBatchResponse,
+    TaskOutcomesBatchParam, TaskOutcomesBatchResponse, TaskSnapshot as ControlTaskSnapshot,
+    TaskSubmitBatchParam, TaskSubmitBatchResponse, TaskWaitParam, TaskWaitResponse,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -896,6 +897,8 @@ impl ServiceRuntimeInner {
             ControlMethod::TaskList => self.task_list(),
             ControlMethod::TaskCancel => self.task_cancel(request.params),
             ControlMethod::TaskOutcome => self.task_outcome(request.params),
+            ControlMethod::TaskOutcomesBatch => self.task_outcomes_batch(request.params),
+            ControlMethod::TaskWait => self.task_wait(request.params),
             ControlMethod::TaskEventsAfter => self.task_events_after(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
@@ -1299,8 +1302,8 @@ impl ServiceRuntimeInner {
             Ok(param) => param,
             Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
         };
-        let mut guard = self.host_runtime.lock().expect("host runtime mutex");
-        let Some(runtime) = guard.as_mut() else {
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
             return ControlResponse::err(ControlError::Failed("core is not running".into()));
         };
         let handle = match resolve_task_handle(runtime, &param.id) {
@@ -1315,6 +1318,123 @@ impl ServiceRuntimeInner {
                 "unexpected task outcome reply: {other:?}"
             ))),
             Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn task_outcomes_batch(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<TaskOutcomesBatchParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        if param.ids.is_empty() {
+            return ControlResponse::err(ControlError::BadRequest(
+                "task outcomes batch requires at least one id".into(),
+            ));
+        }
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        let handles = match resolve_task_handles(runtime, &param.ids) {
+            Ok(handles) => handles,
+            Err(error) => return ControlResponse::err(error),
+        };
+        match runtime.task_states(handles) {
+            Ok(states) => ControlResponse::ok(TaskOutcomesBatchResponse {
+                outcomes: states
+                    .into_iter()
+                    .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
+                    .collect(),
+            }),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn task_wait(&self, params: Value) -> ControlResponse {
+        let param = match serde_json::from_value::<TaskWaitParam>(params) {
+            Ok(param) => param,
+            Err(error) => return ControlResponse::err(ControlError::BadRequest(error.to_string())),
+        };
+        if param.ids.is_empty() {
+            return ControlResponse::err(ControlError::BadRequest(
+                "task wait requires at least one id".into(),
+            ));
+        }
+        let (subscription, handles) = {
+            let guard = self.host_runtime.lock().expect("host runtime mutex");
+            let Some(runtime) = guard.as_ref() else {
+                return ControlResponse::err(ControlError::Failed("core is not running".into()));
+            };
+            let handles = match resolve_task_handles(runtime, &param.ids) {
+                Ok(handles) => handles,
+                Err(error) => return ControlResponse::err(error),
+            };
+            (runtime.subscribe_task_completions(), handles)
+        };
+        let timeout = std::time::Duration::from_millis(param.timeout_ms);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut revision = subscription.revision();
+        loop {
+            let states = {
+                let guard = self.host_runtime.lock().expect("host runtime mutex");
+                let Some(runtime) = guard.as_ref() else {
+                    return ControlResponse::err(ControlError::Failed(
+                        "core is not running".into(),
+                    ));
+                };
+                match runtime.task_states(handles.clone()) {
+                    Ok(states) => states,
+                    Err(error) => {
+                        return ControlResponse::err(ControlError::Failed(error.to_string()));
+                    }
+                }
+            };
+            let all_terminal = states
+                .iter()
+                .all(|state| is_terminal_task_status(state.status.as_ref()));
+            if all_terminal {
+                return ControlResponse::ok(TaskWaitResponse {
+                    outcomes: states
+                        .into_iter()
+                        .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
+                        .collect(),
+                    timed_out: false,
+                });
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return ControlResponse::ok(TaskWaitResponse {
+                    outcomes: states
+                        .into_iter()
+                        .map(|state| to_control_task_outcome(&state.handle.task_id, state.outcome))
+                        .collect(),
+                    timed_out: true,
+                });
+            }
+            match subscription.wait_after_timeout(revision, deadline.saturating_duration_since(now))
+            {
+                Some(next_revision) => revision = next_revision,
+                None => {
+                    let guard = self.host_runtime.lock().expect("host runtime mutex");
+                    let Some(runtime) = guard.as_ref() else {
+                        return ControlResponse::err(ControlError::Failed(
+                            "core is not running".into(),
+                        ));
+                    };
+                    return match runtime.task_states(handles) {
+                        Ok(states) => ControlResponse::ok(TaskWaitResponse {
+                            outcomes: states
+                                .into_iter()
+                                .map(|state| {
+                                    to_control_task_outcome(&state.handle.task_id, state.outcome)
+                                })
+                                .collect(),
+                            timed_out: true,
+                        }),
+                        Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+                    };
+                }
+            }
         }
     }
 
@@ -2149,29 +2269,53 @@ fn runtime_stop_state(state: RuntimeStopState) -> &'static str {
     }
 }
 
-fn resolve_task_handle(
-    runtime: &mut HostRuntime,
-    task_id: &str,
-) -> Result<TaskHandle, ControlError> {
+fn resolve_task_handle(runtime: &HostRuntime, task_id: &str) -> Result<TaskHandle, ControlError> {
+    let id = task_id.to_owned();
+    let mut handles = resolve_task_handles(runtime, std::slice::from_ref(&id))?;
+    Ok(handles.remove(0))
+}
+
+fn resolve_task_handles(
+    runtime: &HostRuntime,
+    task_ids: &[String],
+) -> Result<Vec<TaskHandle>, ControlError> {
     let snapshots = runtime
         .task_snapshots()
         .map_err(|error| ControlError::Failed(error.to_string()))?;
-    let Some(snapshot) = snapshots
+    let mut by_id = snapshots
         .into_iter()
-        .find(|snapshot| snapshot.task_id == task_id)
-    else {
-        return Err(ControlError::Failed(format!(
-            "task {task_id} was not found"
-        )));
-    };
-    Ok(TaskHandle {
-        task_id: snapshot.task_id,
-        protocol_id: snapshot.protocol_id,
-        target_binding_id: snapshot.target_binding_id,
-        cancel_policy: CancelPolicy::Cascade,
-        trace_id: snapshot.trace_id,
-        correlation_id: snapshot.correlation_id,
-    })
+        .map(|snapshot| (snapshot.task_id.clone(), snapshot))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut handles = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        let Some(snapshot) = by_id.remove(task_id) else {
+            return Err(ControlError::Failed(format!(
+                "task {task_id} was not found"
+            )));
+        };
+        handles.push(TaskHandle {
+            task_id: snapshot.task_id,
+            protocol_id: snapshot.protocol_id,
+            target_binding_id: snapshot.target_binding_id,
+            cancel_policy: CancelPolicy::Cascade,
+            trace_id: snapshot.trace_id,
+            correlation_id: snapshot.correlation_id,
+        });
+    }
+    Ok(handles)
+}
+
+fn is_terminal_task_status(status: Option<&TaskStatus>) -> bool {
+    matches!(
+        status,
+        Some(
+            TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+                | TaskStatus::Expired
+                | TaskStatus::DeadLetter
+        )
+    )
 }
 
 fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {

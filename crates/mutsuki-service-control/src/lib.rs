@@ -45,6 +45,8 @@ pub enum ControlMethod {
     TaskEventsAfter = 0x0012,
     HealthCheck = 0x0013,
     LogTail = 0x0014,
+    TaskOutcomesBatch = 0x0015,
+    TaskWait = 0x0016,
 }
 
 impl ControlMethod {
@@ -74,6 +76,8 @@ impl ControlMethod {
             0x0012 => Self::TaskEventsAfter,
             0x0013 => Self::HealthCheck,
             0x0014 => Self::LogTail,
+            0x0015 => Self::TaskOutcomesBatch,
+            0x0016 => Self::TaskWait,
             _ => return None,
         })
     }
@@ -327,6 +331,35 @@ pub struct HealthReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdParam {
     pub id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskOutcomesBatchParam {
+    pub ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskOutcomesBatchResponse {
+    pub outcomes: Vec<TaskOutcomeView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWaitParam {
+    pub ids: Vec<String>,
+    #[serde(default = "default_task_wait_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_task_wait_timeout_ms() -> u64 {
+    5_000
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskWaitResponse {
+    pub outcomes: Vec<TaskOutcomeView>,
+    pub timed_out: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

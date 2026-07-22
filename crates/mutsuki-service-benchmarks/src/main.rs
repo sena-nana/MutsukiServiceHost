@@ -2,14 +2,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use mutsuki_runtime_contracts::{ArtifactType, PluginArtifact, Task, TaskBatch};
 use mutsuki_service_benchmarks::{FixtureRunner, PLUGIN_ID, fixture_manifest_for};
 use mutsuki_service_config::{ConfiguredPluginSelection, ServiceConfig};
-use mutsuki_service_control::{
-    ControlMethod, TaskOutcomeView, TaskSubmitBatchParam, TaskSubmitBatchResponse,
-};
+use mutsuki_service_control::{ControlMethod, TaskSubmitBatchParam, TaskSubmitBatchResponse};
 use mutsuki_service_ipc::{ControlClient, ControlClientConfig};
 use mutsuki_service_plugin_loader::{ExternalRuntimeSpec, PluginToml};
 use mutsuki_service_runtime::{ServiceRuntime, ServiceRuntimeBuilder};
@@ -49,6 +47,10 @@ struct Sample {
     startup_ns: f64,
     health_ipc_ns: f64,
     echo_e2e_ns: f64,
+    concurrent_wave_ns: f64,
+    concurrent_wave_tasks: u64,
+    sustained_inflight_ns: f64,
+    sustained_inflight_tasks: u64,
     reload_ns: f64,
     shutdown_ns: f64,
 }
@@ -129,6 +131,16 @@ async fn run_sample(
         failures.push(format!("{} echo hash {echo_hash}", deployment.name()));
     }
 
+    let wave_tasks = 256_u64;
+    let concurrent_wave = Instant::now();
+    run_task_wave(&client, "wave", wave_tasks as usize).await?;
+    let concurrent_wave_ns = concurrent_wave.elapsed().as_nanos() as f64;
+
+    let sustained_tasks = 512_u64;
+    let sustained_inflight = Instant::now();
+    run_sustained_inflight(&client, "sustained", sustained_tasks as usize, 128).await?;
+    let sustained_inflight_ns = sustained_inflight.elapsed().as_nanos() as f64;
+
     if run_fixture_suite {
         verify_fixtures(&client, deployment, fixture_hashes, failures).await?;
     }
@@ -144,6 +156,10 @@ async fn run_sample(
         startup_ns,
         health_ipc_ns,
         echo_e2e_ns,
+        concurrent_wave_ns,
+        concurrent_wave_tasks: wave_tasks,
+        sustained_inflight_ns,
+        sustained_inflight_tasks: sustained_tasks,
         reload_ns,
         shutdown_ns,
     })
@@ -363,26 +379,149 @@ async fn execute_fixture(
     if submitted.handles.len() != 1 {
         return Err("submission returned an unexpected handle count".into());
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let outcome =
-            checked_request(client, ControlMethod::TaskOutcome, json!({"id": task_id})).await?;
-        let outcome: TaskOutcomeView =
-            serde_json::from_value(outcome).map_err(|error| error.to_string())?;
-        match outcome.status.as_str() {
-            "completed" => return Ok(outcome.output.unwrap_or(Value::Null)),
-            "failed" | "cancelled" | "expired" | "dead_letter" => {
-                return Err(format!(
-                    "{}:{}:{}",
-                    outcome.error_code.unwrap_or_default(),
-                    outcome.reason.unwrap_or_default(),
-                    serde_json::to_string(&outcome.evidence).unwrap_or_default()
-                ));
+    let wait = checked_request(
+        client,
+        ControlMethod::TaskWait,
+        json!({
+            "ids": [task_id],
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await?;
+    let wait: mutsuki_service_control::TaskWaitResponse =
+        serde_json::from_value(wait).map_err(|error| error.to_string())?;
+    let outcome = wait
+        .outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "task wait returned no outcomes".to_string())?;
+    if wait.timed_out && outcome.status == "pending" {
+        return Err(format!("task {task_id} timed out in state pending"));
+    }
+    match outcome.status.as_str() {
+        "completed" => Ok(outcome.output.unwrap_or(Value::Null)),
+        "failed" | "cancelled" | "expired" | "dead_letter" => Err(format!(
+            "{}:{}:{}",
+            outcome.error_code.unwrap_or_default(),
+            outcome.reason.unwrap_or_default(),
+            serde_json::to_string(&outcome.evidence).unwrap_or_default()
+        )),
+        status => Err(format!("task {task_id} ended in unexpected state {status}")),
+    }
+}
+
+async fn run_task_wave(client: &ControlClient, prefix: &str, tasks: usize) -> Result<(), String> {
+    let mut batch_tasks = Vec::with_capacity(tasks);
+    let mut ids = Vec::with_capacity(tasks);
+    for index in 0..tasks {
+        let task_id = format!("{prefix}-{index}");
+        ids.push(task_id.clone());
+        batch_tasks.push(Task::new(
+            task_id,
+            "runner.echo",
+            json!({"message": "wave", "sequence": index}),
+        ));
+    }
+    let submitted = checked_request(
+        client,
+        ControlMethod::TaskSubmitBatch,
+        serde_json::to_value(TaskSubmitBatchParam {
+            batch: TaskBatch {
+                batch_id: format!("batch-{prefix}"),
+                tick_id: None,
+                tasks: batch_tasks,
+                resource_plan: None,
+            },
+        })
+        .map_err(|error| error.to_string())?,
+    )
+    .await?;
+    let submitted: TaskSubmitBatchResponse =
+        serde_json::from_value(submitted).map_err(|error| error.to_string())?;
+    if submitted.handles.len() != tasks {
+        return Err(format!(
+            "wave submitted {} handles, expected {tasks}",
+            submitted.handles.len()
+        ));
+    }
+    wait_task_ids(client, &ids).await
+}
+
+async fn run_sustained_inflight(
+    client: &ControlClient,
+    prefix: &str,
+    total_tasks: usize,
+    inflight: usize,
+) -> Result<(), String> {
+    let mut next_id = 0usize;
+    let mut outstanding = Vec::new();
+    while next_id < total_tasks || !outstanding.is_empty() {
+        while outstanding.len() < inflight && next_id < total_tasks {
+            let task_id = format!("{prefix}-{next_id}");
+            let submitted = checked_request(
+                client,
+                ControlMethod::TaskSubmitBatch,
+                serde_json::to_value(TaskSubmitBatchParam {
+                    batch: TaskBatch::one(
+                        format!("batch-{task_id}"),
+                        Task::new(
+                            &task_id,
+                            "runner.echo",
+                            json!({"message": "sustained", "sequence": next_id}),
+                        ),
+                    ),
+                })
+                .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let submitted: TaskSubmitBatchResponse =
+                serde_json::from_value(submitted).map_err(|error| error.to_string())?;
+            if submitted.handles.len() != 1 {
+                return Err("sustained submit returned unexpected handle count".into());
             }
-            _ if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(1)).await,
-            status => return Err(format!("task {task_id} timed out in state {status}")),
+            outstanding.push(task_id);
+            next_id += 1;
+        }
+        wait_task_ids(client, &outstanding).await?;
+        outstanding.clear();
+    }
+    Ok(())
+}
+
+async fn wait_task_ids(client: &ControlClient, ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let wait = checked_request(
+        client,
+        ControlMethod::TaskWait,
+        json!({
+            "ids": ids,
+            "timeout_ms": 10_000,
+        }),
+    )
+    .await?;
+    let wait: mutsuki_service_control::TaskWaitResponse =
+        serde_json::from_value(wait).map_err(|error| error.to_string())?;
+    if wait.outcomes.len() != ids.len() {
+        return Err(format!(
+            "task wait returned {} outcomes, expected {}",
+            wait.outcomes.len(),
+            ids.len()
+        ));
+    }
+    for outcome in wait.outcomes {
+        if outcome.status != "completed" {
+            return Err(format!(
+                "task {} ended in state {}",
+                outcome.task_id, outcome.status
+            ));
         }
     }
+    if wait.timed_out {
+        return Err("task wait timed out with pending work".into());
+    }
+    Ok(())
 }
 
 async fn checked_request(
@@ -448,6 +587,20 @@ fn build_report(
                     .collect::<Vec<f64>>(),
             ),
             (
+                "concurrent-wave",
+                values
+                    .iter()
+                    .map(|value| value.concurrent_wave_ns)
+                    .collect::<Vec<f64>>(),
+            ),
+            (
+                "sustained-inflight",
+                values
+                    .iter()
+                    .map(|value| value.sustained_inflight_ns)
+                    .collect::<Vec<f64>>(),
+            ),
+            (
                 "reload",
                 values
                     .iter()
@@ -462,11 +615,35 @@ fn build_report(
                     .collect::<Vec<f64>>(),
             ),
         ] {
+            let mut metrics = json!({"latency_ns": distribution(&observations, "ns")});
+            if metric == "concurrent-wave" || metric == "sustained-inflight" {
+                let tasks = if metric == "concurrent-wave" {
+                    values.first().map(|value| value.concurrent_wave_tasks)
+                } else {
+                    values.first().map(|value| value.sustained_inflight_tasks)
+                }
+                .unwrap_or(0) as f64;
+                let throughput = observations
+                    .iter()
+                    .map(|elapsed_ns| {
+                        if *elapsed_ns <= 0.0 {
+                            0.0
+                        } else {
+                            tasks * 1_000_000_000.0 / elapsed_ns
+                        }
+                    })
+                    .collect::<Vec<f64>>();
+                metrics = json!({
+                    "latency_ns": distribution(&observations, "ns"),
+                    "throughput_tasks_per_s": distribution(&throughput, "tasks/s"),
+                    "tasks": tasks,
+                });
+            }
             cases.push(json!({
                 "case_id": format!("service-host.{deployment}.{metric}"),
                 "measurement_mode": "time",
                 "dimensions": {"deployment": deployment, "operation": metric},
-                "metrics": {"latency_ns": distribution(&observations, "ns")},
+                "metrics": metrics,
                 "correctness": {"passed": failures.is_empty(), "counters": {}},
             }));
         }
