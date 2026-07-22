@@ -1,6 +1,31 @@
 # Control API
 
-The control API is a JSON line request/response protocol.
+The control plane speaks a local authenticated request/response protocol over Named Pipe
+(Windows), Unix Socket (POSIX), or loopback-only TCP debug.
+
+## Transport profiles
+
+Production default is a **persistent binary** session:
+
+- length-prefixed frames (`MSHC` magic) with stable `ControlMethod` opcodes;
+- MessagePack payloads (ServiceHost-owned opcode space, separate from Runner Wire);
+- multiplexed in-flight requests correlated by `RequestId`;
+- hard limits on frame/payload size, pending depth, idle timeout, and MessagePack nesting.
+
+`jsonl` remains a **diagnostics / migration** profile: newline-delimited JSON, sequential on a
+persistent connection, with a hard max line length. New high-frequency callers must not default to it.
+
+Public client surface:
+
+```rust
+ControlClient::connect(...)
+ControlSession::request(...)
+ControlSession::close(...)
+ControlClient::request(...)          // persistent session with reconnect
+ControlClient::request_oneshot(...)  // explicit one-shot compatibility API
+```
+
+## JSONL compatibility envelope
 
 Request:
 

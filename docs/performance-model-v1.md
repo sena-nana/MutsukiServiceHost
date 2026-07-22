@@ -35,3 +35,15 @@ the builtin, ABI and Rust-process reports and retains their local/fixed-machine 
 `artifacts/performance/`. Promotion requires a clean repository-revision snapshot, matching
 environment fingerprint and an exact-byte approval created with MutsukiCore's performance contract
 tooling. A new CI artifact is never promoted automatically.
+
+## Control IPC (Issue #16)
+
+Dedicated control-plane harness:
+
+```sh
+cargo run -p mutsuki-service-benchmarks --release --bin mutsuki-control-ipc-bench -- \
+  --output artifacts/performance/issue16-macos-arm64/report.json
+```
+
+It compares one-shot JSONL, persistent JSONL, and persistent binary across in-flight and payload
+sizes, and enforces p95, connections/request, and allocation-overhead gates.

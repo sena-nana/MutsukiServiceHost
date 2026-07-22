@@ -21,29 +21,79 @@ pub struct ControlRequest {
     pub params: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlMethod {
-    ServiceStatus,
-    ServiceShutdown,
-    CoreStatus,
-    PluginList,
-    PluginReload,
-    PluginDeploymentSet,
-    PluginDeploymentClear,
-    RunnerList,
-    RunnerRestart,
-    RunnerStop,
-    EventSourceList,
-    EventSourceRestart,
-    CoreBeginDrain,
-    TaskSubmitBatch,
-    TaskList,
-    TaskCancel,
-    TaskOutcome,
-    TaskEventsAfter,
-    HealthCheck,
-    LogTail,
+    ServiceStatus = 0x0001,
+    ServiceShutdown = 0x0002,
+    CoreStatus = 0x0003,
+    PluginList = 0x0004,
+    PluginReload = 0x0005,
+    PluginDeploymentSet = 0x0006,
+    PluginDeploymentClear = 0x0007,
+    RunnerList = 0x0008,
+    RunnerRestart = 0x0009,
+    RunnerStop = 0x000A,
+    EventSourceList = 0x000B,
+    EventSourceRestart = 0x000C,
+    CoreBeginDrain = 0x000D,
+    TaskSubmitBatch = 0x000E,
+    TaskList = 0x000F,
+    TaskCancel = 0x0010,
+    TaskOutcome = 0x0011,
+    TaskEventsAfter = 0x0012,
+    HealthCheck = 0x0013,
+    LogTail = 0x0014,
+}
+
+impl ControlMethod {
+    pub const fn opcode(self) -> u16 {
+        self as u16
+    }
+
+    pub fn from_opcode(opcode: u16) -> Option<Self> {
+        Some(match opcode {
+            0x0001 => Self::ServiceStatus,
+            0x0002 => Self::ServiceShutdown,
+            0x0003 => Self::CoreStatus,
+            0x0004 => Self::PluginList,
+            0x0005 => Self::PluginReload,
+            0x0006 => Self::PluginDeploymentSet,
+            0x0007 => Self::PluginDeploymentClear,
+            0x0008 => Self::RunnerList,
+            0x0009 => Self::RunnerRestart,
+            0x000A => Self::RunnerStop,
+            0x000B => Self::EventSourceList,
+            0x000C => Self::EventSourceRestart,
+            0x000D => Self::CoreBeginDrain,
+            0x000E => Self::TaskSubmitBatch,
+            0x000F => Self::TaskList,
+            0x0010 => Self::TaskCancel,
+            0x0011 => Self::TaskOutcome,
+            0x0012 => Self::TaskEventsAfter,
+            0x0013 => Self::HealthCheck,
+            0x0014 => Self::LogTail,
+            _ => return None,
+        })
+    }
+
+    /// Mutating ops stay ordered on a connection under multiplex.
+    pub const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::ServiceShutdown
+                | Self::PluginReload
+                | Self::PluginDeploymentSet
+                | Self::PluginDeploymentClear
+                | Self::RunnerRestart
+                | Self::RunnerStop
+                | Self::EventSourceRestart
+                | Self::CoreBeginDrain
+                | Self::TaskSubmitBatch
+                | Self::TaskCancel
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

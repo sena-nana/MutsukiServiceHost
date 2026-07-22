@@ -640,6 +640,8 @@ version = "0.1.0"
 dependencies = [
  "mutsuki-service-config",
  "mutsuki-service-control",
+ "rmp-serde",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

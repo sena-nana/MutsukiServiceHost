@@ -270,6 +270,7 @@ async fn request_and_print(
 ) -> anyhow::Result<()> {
     let client = mutsuki_service_ipc::ControlClient::new(config.into());
     let response = client.request(method, params).await?;
+    let _ = client.close().await;
     println!("{}", serde_json::to_string_pretty(&json!(response))?);
     Ok(())
 }

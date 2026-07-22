@@ -36,3 +36,7 @@ path = "src/bin/benchmark_runner.rs"
 [[bin]]
 name = "mutsuki-benchmark-service"
 path = "src/bin/benchmark_service.rs"
+
+[[bin]]
+name = "mutsuki-control-ipc-bench"
+path = "src/bin/control_ipc_bench.rs"

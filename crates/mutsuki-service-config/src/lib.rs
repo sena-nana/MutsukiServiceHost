@@ -391,9 +391,16 @@ impl CoreSection {
 pub struct IpcSection {
     pub enabled: bool,
     pub transport: IpcTransport,
+    pub codec: IpcCodec,
     pub name: String,
     pub token: Option<String>,
     pub tcp_debug_addr: Option<String>,
+    pub max_frame_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub max_jsonl_line_bytes: usize,
+    pub max_in_flight: usize,
+    pub idle_timeout_ms: u64,
+    pub request_timeout_ms: u64,
 }
 
 impl Default for IpcSection {
@@ -401,9 +408,16 @@ impl Default for IpcSection {
         Self {
             enabled: true,
             transport: default_transport(),
+            codec: IpcCodec::Binary,
             name: "mutsuki-service-default".into(),
             token: None,
             tcp_debug_addr: None,
+            max_frame_bytes: 1024 * 1024,
+            max_payload_bytes: 512 * 1024,
+            max_jsonl_line_bytes: 256 * 1024,
+            max_in_flight: 64,
+            idle_timeout_ms: 60_000,
+            request_timeout_ms: 30_000,
         }
     }
 }
@@ -414,6 +428,14 @@ pub enum IpcTransport {
     NamedPipe,
     UnixSocket,
     TcpDebug,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IpcCodec {
+    #[default]
+    Binary,
+    Jsonl,
 }
 
 impl Default for IpcTransport {
