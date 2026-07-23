@@ -45,7 +45,7 @@ use mutsuki_service_control::{
     TaskWaitParam, TaskWaitResponse,
 };
 use mutsuki_service_ipc::IpcServer;
-use mutsuki_service_link::LinkControlServer;
+use mutsuki_service_link::{LinkControlServer, QuicLinkControlServer, server_config_from_pem};
 use mutsuki_service_plugin_loader::{
     BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginInventory, PluginLoaderError,
     PluginRecord,
@@ -285,6 +285,8 @@ pub enum ServiceRuntimeError {
     Ipc(#[from] mutsuki_service_ipc::IpcError),
     #[error("link control bridge failed: {0}")]
     LinkControl(#[from] mutsuki_service_link::LinkControlServerError),
+    #[error("quic link control bridge failed: {0}")]
+    QuicLinkControl(String),
     #[error("external runner link {link} for plugin {plugin_id} is not supported")]
     UnsupportedRunnerLink { plugin_id: String, link: String },
     #[error("external runner {runner_id} failed to start: {detail}")]
@@ -332,6 +334,7 @@ pub struct ServiceRuntime {
     shutdown_rx: Option<oneshot::Receiver<String>>,
     ipc_server: Option<IpcServer>,
     link_control_server: Option<LinkControlServer>,
+    quic_link_control_server: Option<QuicLinkControlServer>,
     _observe: mutsuki_service_observe::ObserveGuard,
 }
 
@@ -671,11 +674,13 @@ impl ServiceRuntimeBuilder {
             Some(LinkControlServer::start(
                 &inner.config.service.run_dir,
                 &inner.config.service.instance_id,
-                control_handler,
+                control_handler.clone(),
             )?)
         } else {
             None
         };
+        let quic_link_control_server =
+            start_quic_link_control_server(&inner.config, control_handler)?;
         let graceful = Duration::from_millis(config.runners.graceful_shutdown_ms);
         for source in event_sources {
             event_source_supervisor.start(source, task_submitter.clone(), &config, graceful);
@@ -685,6 +690,7 @@ impl ServiceRuntimeBuilder {
             shutdown_rx: Some(shutdown_rx),
             ipc_server,
             link_control_server,
+            quic_link_control_server,
             _observe: observe,
         })
     }
@@ -830,6 +836,7 @@ impl ServiceRuntime {
     }
 
     pub async fn shutdown(mut self) {
+        drop(self.quic_link_control_server.take());
         drop(self.link_control_server.take());
         if let Some(server) = self.ipc_server.take() {
             server.shutdown().await;
@@ -860,6 +867,63 @@ impl ServiceRuntime {
     pub fn control_token(&self) -> &str {
         self.inner.config.control_token()
     }
+
+    /// Bound address of the optional QUIC Link control listener.
+    pub fn quic_link_addr(&self) -> Option<std::net::SocketAddr> {
+        self.quic_link_control_server
+            .as_ref()
+            .map(QuicLinkControlServer::local_addr)
+    }
+}
+
+fn start_quic_link_control_server(
+    config: &ServiceConfig,
+    handler: Arc<dyn ControlHandler>,
+) -> ServiceRuntimeResult<Option<QuicLinkControlServer>> {
+    let quic = &config.link.quic;
+    if !quic.enabled {
+        return Ok(None);
+    }
+    let cert_key = quic
+        .cert_pem_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty());
+    let key_key = quic
+        .key_pem_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty());
+    let (Some(cert_key), Some(key_key)) = (cert_key, key_key) else {
+        return Err(ServiceRuntimeError::QuicLinkControl(
+            "link.quic.enabled requires link.quic.cert_pem_key and link.quic.key_pem_key".into(),
+        ));
+    };
+    let store = config.host_secret_store();
+    let cert_pem = store.resolve(cert_key).ok_or_else(|| {
+        ServiceRuntimeError::QuicLinkControl(format!(
+            "secret key `{cert_key}` for link.quic.cert_pem_key is not configured"
+        ))
+    })?;
+    let key_pem = store.resolve(key_key).ok_or_else(|| {
+        ServiceRuntimeError::QuicLinkControl(format!(
+            "secret key `{key_key}` for link.quic.key_pem_key is not configured"
+        ))
+    })?;
+    if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+        return Err(ServiceRuntimeError::QuicLinkControl(
+            "link.quic TLS identity PEMs must not be empty".into(),
+        ));
+    }
+    let server_config = server_config_from_pem(&cert_pem, &key_pem)
+        .map_err(|error| ServiceRuntimeError::QuicLinkControl(error.to_string()))?;
+    let bind: std::net::SocketAddr = quic.listen.parse().map_err(|error| {
+        ServiceRuntimeError::QuicLinkControl(format!(
+            "invalid link.quic.listen `{}`: {error}",
+            quic.listen
+        ))
+    })?;
+    QuicLinkControlServer::start(bind, server_config, handler)
+        .map(Some)
+        .map_err(ServiceRuntimeError::QuicLinkControl)
 }
 
 async fn ctrl_c_signal() -> String {
@@ -4020,5 +4084,128 @@ mod tests {
             },
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn escape_toml_string(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
+    fn runtime_config_with_quic_secrets(
+        root: &Path,
+        enabled: bool,
+        include_secrets: bool,
+    ) -> ServiceConfig {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_pem = generated.cert.pem();
+        let key_pem = generated.key_pair.serialize_pem();
+        let secret_path = root.join("local.secret.toml");
+        let mut secrets = String::from("[secrets]\n");
+        if include_secrets {
+            secrets.push_str(&format!(
+                "LINK_QUIC_CERT_PEM = \"{}\"\nLINK_QUIC_KEY_PEM = \"{}\"\n",
+                escape_toml_string(&cert_pem),
+                escape_toml_string(&key_pem)
+            ));
+        } else {
+            secrets.push_str("PLACEHOLDER = \"value\"\n");
+        }
+        fs::write(&secret_path, secrets).unwrap();
+        let config_path = root.join("local.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[service]
+profile = "test"
+instance_id = "quic-link"
+home_dir = "{home}"
+data_dir = "data"
+log_dir = "logs"
+plugin_dir = "plugins"
+run_dir = "run"
+
+[ipc]
+enabled = false
+
+[link.quic]
+enabled = {enabled}
+listen = "127.0.0.1:0"
+cert_pem_key = "LINK_QUIC_CERT_PEM"
+key_pem_key = "LINK_QUIC_KEY_PEM"
+
+[observe]
+console = false
+
+[security]
+secret_file = "local.secret.toml"
+"#,
+                home = root.to_string_lossy().replace('\\', "/"),
+                enabled = enabled,
+            ),
+        )
+        .unwrap();
+        ServiceConfig::load(mutsuki_service_config::ConfigOverrides {
+            config_file: Some(config_path),
+            control_token: Some("local-dev".into()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_link_requires_identity_secrets_when_enabled() {
+        let dir = tempdir().expect("temp dir");
+        let config = runtime_config_with_quic_secrets(dir.path(), true, false);
+        let error = match ServiceRuntimeBuilder::new(config).start().await {
+            Ok(_) => panic!("expected quic identity failure"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ServiceRuntimeError::QuicLinkControl(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("LINK_QUIC_CERT_PEM"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_link_control_health_roundtrip_via_runtime() {
+        use mutsuki_service_control::ControlMethod;
+        use mutsuki_service_link::{QuicLinkControlHandler, client_config_from_ca_pem};
+
+        let dir = tempdir().expect("temp dir");
+        let config = runtime_config_with_quic_secrets(dir.path(), true, true);
+        let secret = config.secret("LINK_QUIC_CERT_PEM").expect("cert pem");
+        let runtime = ServiceRuntimeBuilder::new(config).start().await.unwrap();
+        let addr = runtime.quic_link_addr().expect("quic listener");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = QuicLinkControlHandler::new(
+            addr,
+            "localhost",
+            client_config_from_ca_pem(&secret).unwrap(),
+        );
+        let health = client
+            .handle(ControlRequest {
+                token: "local-dev".into(),
+                method: ControlMethod::HealthCheck,
+                params: Value::Null,
+            })
+            .await;
+        assert!(health.ok, "{health:?}");
+        assert_eq!(health.result.unwrap()["service"], "ok");
+
+        let status = client
+            .handle(ControlRequest {
+                token: "local-dev".into(),
+                method: ControlMethod::ServiceStatus,
+                params: Value::Null,
+            })
+            .await;
+        assert!(status.ok, "{status:?}");
+        assert_eq!(status.result.unwrap()["instance_id"], "quic-link");
+
+        runtime.shutdown().await;
     }
 }

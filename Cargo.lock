@@ -855,6 +855,7 @@ dependencies = [
  "mutsuki-service-observe",
  "mutsuki-service-plugin-loader",
  "mutsuki-service-runner-supervisor",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",

@@ -11,6 +11,7 @@ mutsuki-link-local.workspace = true
 mutsuki-link-quic.workspace = true
 mutsuki-service-control.workspace = true
 quinn.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -19,5 +20,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-rustls.workspace = true
 tempfile.workspace = true
