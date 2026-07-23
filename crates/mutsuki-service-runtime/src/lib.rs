@@ -831,6 +831,17 @@ impl ServiceRuntime {
             let _ = tokio::task::spawn_blocking(move || drop(host_runtime)).await;
         }
     }
+
+    /// Shared control-plane handler for in-process consumers (e.g. Web overview extension).
+    pub fn control_handler(&self) -> Arc<dyn ControlHandler> {
+        Arc::new(RuntimeControl {
+            inner: self.inner.clone(),
+        })
+    }
+
+    pub fn control_token(&self) -> &str {
+        self.inner.config.control_token()
+    }
 }
 
 async fn ctrl_c_signal() -> String {
