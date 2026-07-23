@@ -1,11 +1,11 @@
-//! MutsukiLink control bridge for standalone WebHost consumers.
+//! MutsukiLink control bridge for in-process and library consumers.
 //!
-//! ServiceRuntime exposes a stable `mutsuki.servicehost` local app endpoint.
-//! Authenticated QUIC is available via [`QuicLinkControlServer`] /
-//! [`QuicLinkControlHandler`] with caller-injected TLS identity (see
-//! [`server_config_from_pem`] / [`client_config_from_ca_pem`]). WebHost
-//! forwards typed [`ControlRequest`] frames and receives [`ControlResponse`]
-//! without copying the control protocol.
+//! When IPC is enabled, ServiceRuntime exposes a stable `mutsuki.servicehost`
+//! local app endpoint via [`LinkControlServer`]. Authenticated QUIC helpers
+//! ([`QuicLinkControlServer`] / [`QuicLinkControlHandler`], plus
+//! [`server_config_from_pem`] / [`client_config_from_ca_pem`]) remain available
+//! as library APIs for tests and non-product callers; they are not started from
+//! product Host configuration.
 
 mod client;
 mod protocol;

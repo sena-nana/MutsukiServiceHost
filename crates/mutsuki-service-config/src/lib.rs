@@ -75,8 +75,6 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub ipc: IpcSection,
     #[serde(default)]
-    pub link: LinkSection,
-    #[serde(default)]
     pub plugins: PluginsSection,
     #[serde(default)]
     pub runners: RunnersSection,
@@ -424,37 +422,6 @@ impl Default for IpcSection {
     }
 }
 
-/// Optional Link control transports beyond the local IPC bridge.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LinkSection {
-    pub quic: LinkQuicSection,
-}
-
-/// Authenticated QUIC Link control listener (caller-supplied TLS identity via secret keys).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LinkQuicSection {
-    pub enabled: bool,
-    /// UDP bind address, e.g. `127.0.0.1:4433`.
-    pub listen: String,
-    /// Host secret key referencing the server certificate PEM (no literal PEM in product config).
-    pub cert_pem_key: Option<String>,
-    /// Host secret key referencing the server private key PEM.
-    pub key_pem_key: Option<String>,
-}
-
-impl Default for LinkQuicSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            listen: "127.0.0.1:4433".into(),
-            cert_pem_key: None,
-            key_pem_key: None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IpcTransport {
@@ -728,7 +695,6 @@ impl ServiceConfig {
         self.service = other.service;
         self.core = other.core;
         self.ipc = other.ipc;
-        self.link = other.link;
         self.plugins = other.plugins;
         self.runners = other.runners;
         self.observe = other.observe;
@@ -1323,59 +1289,5 @@ secret_file = "{secret_file}"
         )
         .unwrap();
         path
-    }
-
-    #[test]
-    fn link_quic_section_loads_secret_key_refs() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("local.toml");
-        fs::write(
-            &path,
-            format!(
-                r#"[service]
-profile = "test"
-instance_id = "test"
-home_dir = "{}"
-data_dir = "data"
-log_dir = "logs"
-plugin_dir = "plugins"
-run_dir = "run"
-
-[ipc]
-enabled = false
-
-[link.quic]
-enabled = true
-listen = "127.0.0.1:0"
-cert_pem_key = "LINK_QUIC_CERT_PEM"
-key_pem_key = "LINK_QUIC_KEY_PEM"
-
-[security]
-secret_file = "unused.secret.toml"
-"#,
-                root.path().to_string_lossy().replace('\\', "/")
-            ),
-        )
-        .unwrap();
-        fs::write(
-            root.path().join("unused.secret.toml"),
-            "[secrets]\nPLACEHOLDER = \"value\"\n",
-        )
-        .unwrap();
-        let config = ServiceConfig::load(ConfigOverrides {
-            config_file: Some(path),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(config.link.quic.enabled);
-        assert_eq!(config.link.quic.listen, "127.0.0.1:0");
-        assert_eq!(
-            config.link.quic.cert_pem_key.as_deref(),
-            Some("LINK_QUIC_CERT_PEM")
-        );
-        assert_eq!(
-            config.link.quic.key_pem_key.as_deref(),
-            Some("LINK_QUIC_KEY_PEM")
-        );
     }
 }
