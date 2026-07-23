@@ -150,7 +150,7 @@
       "type": "object",
       "required": [
         "source_id", "plugin_id", "instance_id", "state", "health",
-        "last_error", "reconnects", "last_event_unix_ms"
+        "last_error", "reconnects", "last_event_unix_ms", "started_at_unix_ms"
       ],
       "properties": {
         "source_id": { "type": "string" },
@@ -166,7 +166,8 @@
         },
         "last_error": { "type": ["string", "null"] },
         "reconnects": { "type": "integer", "minimum": 0 },
-        "last_event_unix_ms": { "type": ["integer", "null"], "minimum": 0 }
+        "last_event_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }
       }
     }
   }

@@ -38,10 +38,11 @@ use mutsuki_service_control::{
     CoreDrainResponse, CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams,
     LogTailResponse, PluginCandidateStatus, PluginDeploymentClearParam, PluginDeploymentParam,
     PluginInventoryDiagnostic, PluginListResponse, PluginReloadChange, PluginReloadResponse,
-    PluginStatus, RunnerStatus as ControlRunnerStatus, ServiceStatus, TaskEventPage,
-    TaskEventsAfterParam, TaskFailureSummary as ControlTaskFailureSummary, TaskOutcomeView,
-    TaskOutcomesBatchParam, TaskOutcomesBatchResponse, TaskSnapshot as ControlTaskSnapshot,
-    TaskSubmitBatchParam, TaskSubmitBatchResponse, TaskWaitParam, TaskWaitResponse,
+    PluginStatus, RunnerStatus as ControlRunnerStatus, RuntimeStatisticsView, ServiceStatus,
+    TaskEventPage, TaskEventsAfterParam, TaskFailureSummary as ControlTaskFailureSummary,
+    TaskOutcomeView, TaskOutcomesBatchParam, TaskOutcomesBatchResponse, TaskPoolStatisticsView,
+    TaskSnapshot as ControlTaskSnapshot, TaskSubmitBatchParam, TaskSubmitBatchResponse,
+    TaskWaitParam, TaskWaitResponse,
 };
 use mutsuki_service_ipc::IpcServer;
 use mutsuki_service_plugin_loader::{
@@ -902,6 +903,7 @@ impl ServiceRuntimeInner {
             ControlMethod::TaskEventsAfter => self.task_events_after(request.params),
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
+            ControlMethod::RuntimeStatistics => self.runtime_statistics(),
         }
     }
 
@@ -1274,6 +1276,40 @@ impl ServiceRuntimeInner {
         };
         match runtime.task_snapshots() {
             Ok(snapshots) => ControlResponse::ok(to_control_task_snapshots(snapshots)),
+            Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
+        }
+    }
+
+    fn runtime_statistics(&self) -> ControlResponse {
+        let guard = self.host_runtime.lock().expect("host runtime mutex");
+        let Some(runtime) = guard.as_ref() else {
+            return ControlResponse::err(ControlError::Failed("core is not running".into()));
+        };
+        match runtime.statistics() {
+            Ok(statistics) => ControlResponse::ok(RuntimeStatisticsView {
+                tasks: TaskPoolStatisticsView {
+                    ready: statistics.tasks.ready,
+                    running: statistics.tasks.running,
+                    waiting: statistics.tasks.waiting,
+                    blocked: statistics.tasks.blocked,
+                    completed: statistics.tasks.completed,
+                    failed: statistics.tasks.failed,
+                    cancelled: statistics.tasks.cancelled,
+                    expired: statistics.tasks.expired,
+                    dead_letter: statistics.tasks.dead_letter,
+                    submitted_total: statistics.tasks.submitted_total,
+                    attempts_started: statistics.tasks.attempts_started,
+                    cumulative_queue_steps: statistics.tasks.cumulative_queue_steps,
+                    cumulative_execution_steps: statistics.tasks.cumulative_execution_steps,
+                    stale_results_rejected: statistics.tasks.stale_results_rejected,
+                    terminal_records_evicted: statistics.tasks.terminal_records_evicted,
+                },
+                retained_events: statistics.retained_events,
+                dropped_events: statistics.dropped_events,
+                retained_traces: statistics.retained_traces,
+                dropped_traces: statistics.dropped_traces,
+                scheduler_decisions: statistics.scheduler_decisions,
+            }),
             Err(error) => ControlResponse::err(ControlError::Failed(error.to_string())),
         }
     }
@@ -2741,6 +2777,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_statistics_returns_task_pool_counts() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path()).await;
+        {
+            let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
+            let runtime = guard.as_mut().expect("runtime started");
+            runtime
+                .dispatch(HostRuntimeCommand::SubmitTask(Box::new(Task::new(
+                    "stats-task-1",
+                    "control.input",
+                    json!({}),
+                ))))
+                .expect("submit task");
+        }
+
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::RuntimeStatistics,
+                params: Value::Null,
+            })
+            .await;
+
+        assert!(response.ok);
+        let stats: RuntimeStatisticsView =
+            serde_json::from_value(response.result.expect("result")).expect("runtime statistics");
+        assert_eq!(stats.tasks.ready, 1);
+        assert_eq!(stats.tasks.submitted_total, 1);
+
+        {
+            let mut guard = inner.host_runtime.lock().expect("host runtime mutex");
+            *guard = None;
+        }
+        let missing = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::RuntimeStatistics,
+                params: Value::Null,
+            })
+            .await;
+        assert!(!missing.ok);
+        assert_eq!(missing.error.expect("failed").code, "failed");
+    }
+
+    #[tokio::test]
     async fn task_cancel_and_outcome_use_task_handle() {
         let dir = tempdir().expect("temp dir");
         let inner = test_started_runtime_inner("token", dir.path()).await;
@@ -3565,6 +3646,7 @@ mod tests {
         assert_eq!(sources[0].state, "running");
         assert_eq!(sources[0].health, "healthy");
         assert!(sources[0].last_event_unix_ms.is_some());
+        assert!(sources[0].started_at_unix_ms.is_some());
 
         let health = runtime.inner.health_check().await;
         let health: HealthReport =

@@ -67,8 +67,14 @@ fn control_method_opcodes_are_stable() {
         ControlMethod::from_opcode(0x0013),
         Some(ControlMethod::HealthCheck)
     );
+    assert_eq!(ControlMethod::RuntimeStatistics.opcode(), 0x0017);
+    assert_eq!(
+        ControlMethod::from_opcode(0x0017),
+        Some(ControlMethod::RuntimeStatistics)
+    );
     assert!(ControlMethod::PluginReload.is_mutating());
     assert!(!ControlMethod::HealthCheck.is_mutating());
+    assert!(!ControlMethod::RuntimeStatistics.is_mutating());
 }
 
 #[tokio::test]

@@ -196,6 +196,10 @@ impl SourceStatus {
             last_error: None,
             reconnects: 0,
             last_event_unix_ms: None,
+            started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis()),
         })))
     }
 

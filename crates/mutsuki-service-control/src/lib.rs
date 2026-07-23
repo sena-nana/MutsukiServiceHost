@@ -47,6 +47,7 @@ pub enum ControlMethod {
     LogTail = 0x0014,
     TaskOutcomesBatch = 0x0015,
     TaskWait = 0x0016,
+    RuntimeStatistics = 0x0017,
 }
 
 impl ControlMethod {
@@ -78,6 +79,7 @@ impl ControlMethod {
             0x0014 => Self::LogTail,
             0x0015 => Self::TaskOutcomesBatch,
             0x0016 => Self::TaskWait,
+            0x0017 => Self::RuntimeStatistics,
             _ => return None,
         })
     }
@@ -267,6 +269,39 @@ pub struct EventSourceStatus {
     pub last_error: Option<String>,
     pub reconnects: u32,
     pub last_event_unix_ms: Option<u128>,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u128>,
+}
+
+/// Control-plane mirror of Core `RuntimeStatistics` (Core types are not serde).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeStatisticsView {
+    pub tasks: TaskPoolStatisticsView,
+    pub retained_events: usize,
+    pub dropped_events: u64,
+    pub retained_traces: usize,
+    pub dropped_traces: u64,
+    pub scheduler_decisions: u64,
+}
+
+/// Control-plane mirror of Core `TaskPoolStatistics`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskPoolStatisticsView {
+    pub ready: usize,
+    pub running: usize,
+    pub waiting: usize,
+    pub blocked: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub expired: usize,
+    pub dead_letter: usize,
+    pub submitted_total: u64,
+    pub attempts_started: u64,
+    pub cumulative_queue_steps: u64,
+    pub cumulative_execution_steps: u64,
+    pub stale_results_rejected: u64,
+    pub terminal_records_evicted: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
