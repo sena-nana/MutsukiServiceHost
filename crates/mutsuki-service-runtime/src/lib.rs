@@ -45,6 +45,7 @@ use mutsuki_service_control::{
     TaskWaitParam, TaskWaitResponse,
 };
 use mutsuki_service_ipc::IpcServer;
+use mutsuki_service_link::LinkControlServer;
 use mutsuki_service_plugin_loader::{
     BuiltinRegistry, ExternalRuntimeSpec, PluginCatalog, PluginInventory, PluginLoaderError,
     PluginRecord,
@@ -282,6 +283,8 @@ pub enum ServiceRuntimeError {
     Core(#[from] RuntimeFailure),
     #[error(transparent)]
     Ipc(#[from] mutsuki_service_ipc::IpcError),
+    #[error("link control bridge failed: {0}")]
+    LinkControl(#[from] mutsuki_service_link::LinkControlServerError),
     #[error("external runner link {link} for plugin {plugin_id} is not supported")]
     UnsupportedRunnerLink { plugin_id: String, link: String },
     #[error("external runner {runner_id} failed to start: {detail}")]
@@ -328,6 +331,7 @@ pub struct ServiceRuntime {
     inner: Arc<ServiceRuntimeInner>,
     shutdown_rx: Option<oneshot::Receiver<String>>,
     ipc_server: Option<IpcServer>,
+    link_control_server: Option<LinkControlServer>,
     _observe: mutsuki_service_observe::ObserveGuard,
 }
 
@@ -660,6 +664,18 @@ impl ServiceRuntimeBuilder {
             }),
         )
         .await?;
+        let control_handler: Arc<dyn ControlHandler> = Arc::new(RuntimeControl {
+            inner: inner.clone(),
+        });
+        let link_control_server = if inner.config.ipc.enabled {
+            Some(LinkControlServer::start(
+                &inner.config.service.run_dir,
+                &inner.config.service.instance_id,
+                control_handler,
+            )?)
+        } else {
+            None
+        };
         let graceful = Duration::from_millis(config.runners.graceful_shutdown_ms);
         for source in event_sources {
             event_source_supervisor.start(source, task_submitter.clone(), &config, graceful);
@@ -668,6 +684,7 @@ impl ServiceRuntimeBuilder {
             inner,
             shutdown_rx: Some(shutdown_rx),
             ipc_server,
+            link_control_server,
             _observe: observe,
         })
     }
@@ -813,6 +830,7 @@ impl ServiceRuntime {
     }
 
     pub async fn shutdown(mut self) {
+        drop(self.link_control_server.take());
         if let Some(server) = self.ipc_server.take() {
             server.shutdown().await;
         }

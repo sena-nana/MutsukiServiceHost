@@ -5,6 +5,7 @@ members = [
     "crates/mutsuki-service-runner-supervisor",
     "crates/mutsuki-service-control",
     "crates/mutsuki-service-ipc",
+    "crates/mutsuki-service-link",
     "crates/mutsuki-service-observe",
     "crates/mutsuki-service-daemon",
     "crates/mutsuki-service-runtime",
@@ -51,6 +52,9 @@ mutsuki-service-plugin-loader = { path = "crates/mutsuki-service-plugin-loader" 
 mutsuki-service-runner-supervisor = { path = "crates/mutsuki-service-runner-supervisor" }
 mutsuki-service-control = { path = "crates/mutsuki-service-control" }
 mutsuki-service-ipc = { path = "crates/mutsuki-service-ipc" }
+mutsuki-service-link = { path = "crates/mutsuki-service-link" }
+mutsuki-link-core = { git = "https://github.com/sena-nana/MutsukiLink.git", rev = "26c66311e0e90ddb28d37e886bdda699f8662439" }
+mutsuki-link-local = { git = "https://github.com/sena-nana/MutsukiLink.git", rev = "26c66311e0e90ddb28d37e886bdda699f8662439" }
 mutsuki-service-observe = { path = "crates/mutsuki-service-observe" }
 mutsuki-service-daemon = { path = "crates/mutsuki-service-daemon" }
 mutsuki-service-runtime = { path = "crates/mutsuki-service-runtime" }

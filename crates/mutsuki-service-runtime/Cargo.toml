@@ -16,6 +16,7 @@ mutsuki-runtime-sdk.workspace = true
 mutsuki-service-config.workspace = true
 mutsuki-service-control.workspace = true
 mutsuki-service-ipc.workspace = true
+mutsuki-service-link.workspace = true
 mutsuki-service-observe.workspace = true
 mutsuki-service-plugin-loader.workspace = true
 mutsuki-service-runner-supervisor.workspace = true
