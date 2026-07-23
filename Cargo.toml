@@ -55,6 +55,10 @@ mutsuki-service-ipc = { path = "crates/mutsuki-service-ipc" }
 mutsuki-service-link = { path = "crates/mutsuki-service-link" }
 mutsuki-link-core = { git = "https://github.com/sena-nana/MutsukiLink.git", rev = "26c66311e0e90ddb28d37e886bdda699f8662439" }
 mutsuki-link-local = { git = "https://github.com/sena-nana/MutsukiLink.git", rev = "26c66311e0e90ddb28d37e886bdda699f8662439" }
+mutsuki-link-quic = { git = "https://github.com/sena-nana/MutsukiLink.git", rev = "26c66311e0e90ddb28d37e886bdda699f8662439" }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 mutsuki-service-observe = { path = "crates/mutsuki-service-observe" }
 mutsuki-service-daemon = { path = "crates/mutsuki-service-daemon" }
 mutsuki-service-runtime = { path = "crates/mutsuki-service-runtime" }

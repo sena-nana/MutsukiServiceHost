@@ -139,7 +139,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_control_handler_reaches_server() {
-        let _guard = crate::LINK_TEST_LOCK.lock().expect("link test lock");
+        let _guard = match crate::LINK_TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let dir = tempdir().unwrap();
         let _server =
             LinkControlServer::start(dir.path(), "client-smoke", Arc::new(HealthHandler)).unwrap();
@@ -159,7 +162,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_control_handler_fails_loud_when_absent() {
-        let _guard = crate::LINK_TEST_LOCK.lock().expect("link test lock");
+        let _guard = match crate::LINK_TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let client = LinkControlHandler::for_app("mutsuki.nolink.test");
         let response = client
             .handle(ControlRequest {

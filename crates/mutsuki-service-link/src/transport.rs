@@ -1,13 +1,12 @@
 use std::time::Duration;
 
 use mutsuki_link_core::{Connection, TransportErrorKind};
-use mutsuki_link_local::LocalConnection;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-pub(crate) async fn send_json<T: Serialize>(
-    connection: &mut LocalConnection,
-    value: &T,
+pub(crate) async fn send_json(
+    connection: &mut impl Connection,
+    value: &impl Serialize,
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -26,7 +25,7 @@ pub(crate) async fn send_json<T: Serialize>(
 }
 
 pub(crate) async fn recv_json<T: DeserializeOwned>(
-    connection: &mut LocalConnection,
+    connection: &mut impl Connection,
 ) -> Result<T, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

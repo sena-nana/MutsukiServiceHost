@@ -1,11 +1,14 @@
-//! Local MutsukiLink control bridge for standalone WebHost consumers.
+//! MutsukiLink control bridge for standalone WebHost consumers.
 //!
-//! ServiceRuntime exposes a stable `mutsuki.servicehost` app endpoint. WebHost
-//! forwards typed [`ControlRequest`] frames over Link local IPC and receives
-//! [`ControlResponse`] without direct access to ServiceHost IPC handles.
+//! ServiceRuntime exposes a stable `mutsuki.servicehost` local app endpoint.
+//! Authenticated QUIC is available via [`QuicLinkControlServer`] /
+//! [`QuicLinkControlHandler`] with caller-injected TLS identity. WebHost
+//! forwards typed [`ControlRequest`] frames and receives [`ControlResponse`]
+//! without copying the control protocol.
 
 mod client;
 mod protocol;
+mod quic;
 mod server;
 mod transport;
 
@@ -16,6 +19,7 @@ pub use client::{
 pub use protocol::{
     LinkControlClientFrame, LinkControlRejectCode, LinkControlServerFrame, SERVICE_LINK_APP_ID,
 };
+pub use quic::{QuicLinkControlHandler, QuicLinkControlServer, STANDALONE_LINK_QUIC_UNAVAILABLE};
 pub use server::{LinkControlServer, LinkControlServerError};
 
 #[cfg(test)]

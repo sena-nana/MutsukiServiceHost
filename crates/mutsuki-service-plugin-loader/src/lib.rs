@@ -58,6 +58,8 @@ pub enum PluginLoaderError {
         expected: String,
         actual: String,
     },
+    #[error("plugin {plugin_id} ABI contract invalid: {detail}")]
+    AbiContractInvalid { plugin_id: String, detail: String },
     #[error("failed to read ABI artifact {path}: {source}")]
     ReadArtifact {
         path: PathBuf,
@@ -316,10 +318,77 @@ fn candidate_key(record: &PluginRecord) -> (String, String) {
     )
 }
 
+/// Host-supported ABI codec/bridge inventory and matching entry symbols.
+///
+/// Keep in sync with `mutsuki_runtime_sdk::abi` constants. sha256 proves
+/// integrity only; this inventory is the ABI *contract* checked at scan time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbiContract {
+    pub codec_id: &'static str,
+    pub bridge_id: &'static str,
+    pub entry_symbol: &'static str,
+    pub transport_version: u32,
+}
+
+pub const HOST_ABI_INVENTORY: &[AbiContract] = &[
+    AbiContract {
+        codec_id: "mutsuki.codec.typed-jsonl.v1",
+        bridge_id: "mutsuki.bridge.abi.jsonl.v1",
+        entry_symbol: "mutsuki_plugin_abi_v1",
+        transport_version: 1,
+    },
+    AbiContract {
+        codec_id: "mutsuki.codec.typed-msgpack.v1",
+        bridge_id: "mutsuki.bridge.abi.binary.v2",
+        entry_symbol: "mutsuki_plugin_abi_v2",
+        transport_version: 2,
+    },
+];
+
+/// Resolve the declared ABI backend to a host inventory entry.
+pub fn resolve_abi_contract(manifest: &PluginManifest) -> PluginLoaderResult<AbiContract> {
+    let plugin_id = manifest.plugin_id.clone();
+    if !matches!(manifest.artifact.artifact_type, ArtifactType::Abi) {
+        return Err(PluginLoaderError::AbiContractInvalid {
+            plugin_id,
+            detail: "ABI contract applies only to abi artifacts".into(),
+        });
+    }
+    let backends = manifest
+        .provides
+        .plugin_backends
+        .iter()
+        .filter(|backend| backend.deployment_kind == PluginDeploymentKind::Abi)
+        .collect::<Vec<_>>();
+    let [backend] = backends.as_slice() else {
+        return Err(PluginLoaderError::AbiContractInvalid {
+            plugin_id,
+            detail: "manifest must declare exactly one ABI plugin backend".into(),
+        });
+    };
+    let pair = (backend.codec_id.as_deref(), backend.bridge_id.as_deref());
+    HOST_ABI_INVENTORY
+        .iter()
+        .copied()
+        .find(|contract| Some(contract.codec_id) == pair.0 && Some(contract.bridge_id) == pair.1)
+        .ok_or_else(|| PluginLoaderError::AbiContractInvalid {
+            plugin_id,
+            detail: format!(
+                "unsupported ABI codec/bridge pair {pair:?}; host inventory expects one of {}",
+                HOST_ABI_INVENTORY
+                    .iter()
+                    .map(|c| format!("({}, {})", c.codec_id, c.bridge_id))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+        })
+}
+
 fn validate_abi_artifact(
     manifest_path: &Path,
     manifest: &PluginManifest,
 ) -> PluginLoaderResult<PathBuf> {
+    let contract = resolve_abi_contract(manifest)?;
     let plugin_id = manifest.plugin_id.clone();
     let declared = Path::new(&manifest.artifact.path);
     if declared.is_absolute() || manifest.artifact.path.trim().is_empty() {
@@ -384,6 +453,9 @@ fn validate_abi_artifact(
             actual,
         });
     }
+    // Contract is declared by inventory above; integrity by sha256. Entry symbol
+    // presence is enforced at load time by the ABI transport opener.
+    let _ = contract.entry_symbol;
     Ok(resolved)
 }
 
@@ -461,7 +533,7 @@ fn default_runner_link() -> String {
 mod tests {
     use super::*;
     use mutsuki_runtime_contracts::{
-        LifecyclePolicy, PermissionGrant, PluginArtifact, PluginProvides,
+        LifecyclePolicy, PermissionGrant, PluginArtifact, PluginBackendDescriptor, PluginProvides,
     };
     use tempfile::tempdir;
 
@@ -475,11 +547,11 @@ mod tests {
         let hash = format!("sha256:{:x}", Sha256::digest(b"fixture-library"));
         write_plugin(
             &plugin_dir,
-            manifest(
+            abi_manifest(
                 "test.abi",
-                ArtifactType::Abi,
                 artifact.file_name().unwrap().to_string_lossy().as_ref(),
                 &hash,
+                HOST_ABI_INVENTORY[1],
             ),
         );
 
@@ -495,6 +567,43 @@ mod tests {
             catalog.records[0].resolved_artifact.as_deref(),
             Some(artifact.canonicalize().unwrap().as_path())
         );
+        assert_eq!(
+            resolve_abi_contract(&catalog.records[0].manifest).unwrap(),
+            HOST_ABI_INVENTORY[1]
+        );
+    }
+
+    #[test]
+    fn scan_rejects_abi_artifact_without_supported_backend_inventory() {
+        let root = tempdir().unwrap();
+        let plugin_dir = root.path().join("installed").join("abi-bad");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let artifact = plugin_dir.join(format!("abi_bad.{}", platform_library_extension()));
+        fs::write(&artifact, b"fixture-library").unwrap();
+        let hash = format!("sha256:{:x}", Sha256::digest(b"fixture-library"));
+        let mut bad = abi_manifest(
+            "test.abi.bad",
+            artifact.file_name().unwrap().to_string_lossy().as_ref(),
+            &hash,
+            HOST_ABI_INVENTORY[1],
+        );
+        bad.provides.plugin_backends[0].codec_id = Some("mutsuki.codec.unknown".into());
+        write_plugin(&plugin_dir, bad);
+
+        let inventory = PluginInventory::scan(
+            &[root.path().join("installed")],
+            &root.path().join("disabled"),
+            BuiltinSelection::default(),
+        )
+        .unwrap();
+        assert!(inventory.records.is_empty());
+        assert!(
+            inventory.diagnostics[0]
+                .detail
+                .contains("unsupported ABI codec/bridge"),
+            "{}",
+            inventory.diagnostics[0].detail
+        );
     }
 
     #[test]
@@ -507,11 +616,11 @@ mod tests {
         fs::write(&artifact, b"fixture-library").unwrap();
         write_plugin(
             &abi_dir,
-            manifest(
+            abi_manifest(
                 "test.abi",
-                ArtifactType::Abi,
                 artifact.file_name().unwrap().to_string_lossy().as_ref(),
                 &format!("sha256:{}", "0".repeat(64)),
+                HOST_ABI_INVENTORY[1],
             ),
         );
         let inventory = PluginInventory::scan(
@@ -615,5 +724,23 @@ mod tests {
             },
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn abi_manifest(
+        plugin_id: &str,
+        path: &str,
+        sha256: &str,
+        contract: AbiContract,
+    ) -> PluginManifest {
+        let mut manifest = manifest(plugin_id, ArtifactType::Abi, path, sha256);
+        manifest.provides.plugin_backends = vec![PluginBackendDescriptor {
+            backend_id: "test.abi.backend".into(),
+            deployment_kind: PluginDeploymentKind::Abi,
+            task_client_protocol: "mutsuki.task.v1".into(),
+            resource_client_protocol: "mutsuki.resource-plan.v1".into(),
+            codec_id: Some(contract.codec_id.into()),
+            bridge_id: Some(contract.bridge_id.into()),
+        }];
+        manifest
     }
 }

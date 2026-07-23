@@ -3,12 +3,14 @@ name = "mutsuki-service-link"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MutsukiLink local control bridge for standalone WebHost consumers"
+description = "MutsukiLink local/QUIC control bridge for standalone WebHost consumers"
 
 [dependencies]
 mutsuki-link-core.workspace = true
 mutsuki-link-local.workspace = true
+mutsuki-link-quic.workspace = true
 mutsuki-service-control.workspace = true
+quinn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -16,4 +18,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
 tempfile.workspace = true
