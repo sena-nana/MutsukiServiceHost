@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mutsuki_link_core::{Connection, EndpointId, TransportBudget, TransportErrorKind};
+use mutsuki_link_core::{Connection, EndpointId, TransportBudget};
 use mutsuki_link_local::{
     AppId, EndpointLease, LocalConnection, LocalListener, SessionIdentity, endpoint_id_for_app,
     local_address_for_app, reclaim_stale_lease,
@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::protocol::{
     LinkControlClientFrame, LinkControlRejectCode, LinkControlServerFrame, SERVICE_LINK_APP_ID,
 };
+use crate::transport::{recv_json, send_json};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkControlServerError {
@@ -103,47 +104,6 @@ async fn serve_connection(handler: &Arc<dyn ControlHandler>, connection: &mut Lo
     tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
-async fn send_json<T: serde::Serialize>(
-    connection: &mut LocalConnection,
-    value: &T,
-) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match connection.try_send(&bytes) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind == TransportErrorKind::WouldBlock => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("send timed out".into());
-                }
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-async fn recv_json<T: serde::de::DeserializeOwned>(
-    connection: &mut LocalConnection,
-) -> Result<T, String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match connection.try_receive() {
-            Ok(Some(bytes)) => {
-                return serde_json::from_slice(&bytes).map_err(|error| error.to_string());
-            }
-            Ok(None) => return Err("connection closed before frame".into()),
-            Err(error) if error.kind == TransportErrorKind::WouldBlock => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("receive timed out".into());
-                }
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -188,6 +148,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_control_round_trip_and_auth() {
+        let _guard = crate::LINK_TEST_LOCK.lock().expect("link test lock");
         let dir = tempdir().unwrap();
         let _server =
             LinkControlServer::start(dir.path(), "test-instance", Arc::new(HealthHandler)).unwrap();
@@ -259,6 +220,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn link_control_from_separate_runtime_thread() {
+        let _guard = crate::LINK_TEST_LOCK.lock().expect("link test lock");
         let dir = tempdir().unwrap();
         let _server =
             LinkControlServer::start(dir.path(), "test-instance", Arc::new(HealthHandler)).unwrap();
