@@ -57,6 +57,12 @@ pub enum ConfigError {
     ConfiguredPluginNotFound { plugin_id: String, path: PathBuf },
     #[error("configured plugin {plugin_id} config cannot be represented as TOML: {detail}")]
     InvalidConfiguredPluginValue { plugin_id: String, detail: String },
+    #[error("product surface field `{field}` is read-only")]
+    ProductSurfaceReadOnly { field: String },
+    #[error("unknown product surface field `{field}`")]
+    UnknownProductSurfaceField { field: String },
+    #[error("product surface value invalid for `{field}`: {detail}")]
+    InvalidProductSurfaceValue { field: String, detail: String },
     #[error("failed to persist managed config file {path}: {source}")]
     WriteManagedFile {
         path: PathBuf,
@@ -201,21 +207,25 @@ pub struct ConfiguredPluginStore {
 }
 
 impl ConfiguredPluginStore {
+    /// Open a managed product config file for atomic plugin / product-surface patches.
+    pub fn open(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Atomically replaces one owner plugin's opaque config in the product config file.
     pub fn replace_config(&self, plugin_id: &str, config: serde_json::Value) -> ConfigResult<()> {
         let _write = self
             .write_lock
             .lock()
             .expect("configured plugin write lock");
-        let content = fs::read_to_string(&self.path).map_err(|source| ConfigError::ReadFile {
-            path: self.path.clone(),
-            source,
-        })?;
-        let mut document: toml::Value =
-            toml::from_str(&content).map_err(|source| ConfigError::ParseFile {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut document = self.read_document()?;
         let configured = document
             .get_mut("plugins")
             .and_then(toml::Value::as_table_mut)
@@ -259,6 +269,173 @@ impl ConfiguredPluginStore {
         })?;
         atomic_write(&self.path, content.as_bytes(), false)
     }
+
+    /// Atomically patches known product surface keys under `service` / `web.console`.
+    ///
+    /// Accepted writable keys: `profile`, `console_enabled`, `console_listen`, `include_config`.
+    /// Read-only keys (`instance_id`, `distribution_mode`, `auth_token_key`) are rejected.
+    pub fn patch_product_surface(
+        &self,
+        fields: BTreeMap<String, serde_json::Value>,
+    ) -> ConfigResult<()> {
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("configured plugin write lock");
+        let mut document = self.read_document()?;
+        for (field, value) in fields {
+            apply_product_surface_field(&mut document, &field, value)?;
+        }
+        let content =
+            toml::to_string_pretty(&document).map_err(|source| ConfigError::WriteManagedFile {
+                path: self.path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
+        atomic_write(&self.path, content.as_bytes(), false)
+    }
+
+    fn read_document(&self) -> ConfigResult<toml::Value> {
+        let content = fs::read_to_string(&self.path).map_err(|source| ConfigError::ReadFile {
+            path: self.path.clone(),
+            source,
+        })?;
+        toml::from_str(&content).map_err(|source| ConfigError::ParseFile {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+fn apply_product_surface_field(
+    document: &mut toml::Value,
+    field: &str,
+    value: serde_json::Value,
+) -> ConfigResult<()> {
+    match field {
+        "instance_id" | "distribution_mode" | "auth_token_key" => {
+            Err(ConfigError::ProductSurfaceReadOnly {
+                field: field.into(),
+            })
+        }
+        "profile" => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: field.into(),
+                    detail: "expected string".into(),
+                })?;
+            ensure_table(document, "service")?
+                .insert("profile".into(), toml::Value::String(text.into()));
+            Ok(())
+        }
+        "console_enabled" => {
+            let flag = value
+                .as_bool()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: field.into(),
+                    detail: "expected bool".into(),
+                })?;
+            ensure_nested_table(document, &["web", "console"])?
+                .insert("enabled".into(), toml::Value::Boolean(flag));
+            Ok(())
+        }
+        "console_listen" => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: field.into(),
+                    detail: "expected string".into(),
+                })?;
+            ensure_nested_table(document, &["web", "console"])?
+                .insert("listen".into(), toml::Value::String(text.into()));
+            Ok(())
+        }
+        "include_config" => {
+            let flag = value
+                .as_bool()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: field.into(),
+                    detail: "expected bool".into(),
+                })?;
+            ensure_nested_table(document, &["web", "console"])?
+                .insert("include_config".into(), toml::Value::Boolean(flag));
+            Ok(())
+        }
+        other => Err(ConfigError::UnknownProductSurfaceField {
+            field: other.into(),
+        }),
+    }
+}
+
+fn ensure_table<'a>(
+    document: &'a mut toml::Value,
+    key: &str,
+) -> ConfigResult<&'a mut toml::map::Map<String, toml::Value>> {
+    if !document
+        .as_table()
+        .is_some_and(|table| table.contains_key(key))
+    {
+        document
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                field: key.into(),
+                detail: "document root must be a table".into(),
+            })?
+            .insert(key.into(), toml::Value::Table(toml::map::Map::new()));
+    }
+    document
+        .get_mut(key)
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+            field: key.into(),
+            detail: format!("`{key}` must be a table"),
+        })
+}
+
+fn ensure_nested_table<'a>(
+    document: &'a mut toml::Value,
+    path: &[&str],
+) -> ConfigResult<&'a mut toml::map::Map<String, toml::Value>> {
+    let mut current = document;
+    for (index, key) in path.iter().enumerate() {
+        let is_last = index + 1 == path.len();
+        if current
+            .as_table()
+            .is_none_or(|table| !table.contains_key(*key))
+        {
+            current
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: key.to_string(),
+                    detail: "document path must be tables".into(),
+                })?
+                .insert((*key).into(), toml::Value::Table(toml::map::Map::new()));
+        }
+        current = current
+            .get_mut(*key)
+            .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                field: key.to_string(),
+                detail: "missing nested table".into(),
+            })?;
+        if is_last {
+            return current
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::InvalidProductSurfaceValue {
+                    field: key.to_string(),
+                    detail: "nested path must end at a table".into(),
+                });
+        }
+        if !current.is_table() {
+            return Err(ConfigError::InvalidProductSurfaceValue {
+                field: key.to_string(),
+                detail: "nested path must be tables".into(),
+            });
+        }
+    }
+    Err(ConfigError::InvalidProductSurfaceValue {
+        field: path.join("."),
+        detail: "empty product surface path".into(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -624,10 +801,7 @@ impl ServiceConfig {
         }
         config.load_secret_file(&local_file)?;
         if local_file.is_file() {
-            config.configured_plugin_store = Some(ConfiguredPluginStore {
-                path: local_file,
-                write_lock: Arc::new(Mutex::new(())),
-            });
+            config.configured_plugin_store = Some(ConfiguredPluginStore::open(local_file));
         }
         config.resolve_relative_dirs();
         config.ensure_dirs()?;
@@ -1146,6 +1320,52 @@ mod tests {
             Some("alice")
         );
         assert_eq!(configured[1]["config"]["mode"].as_str(), Some("kept"));
+    }
+
+    #[test]
+    fn product_toml_store_patches_console_surface_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("local.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[service]\nhome_dir = \"{}\"\nprofile = \"bot\"\ninstance_id = \"demo\"\n\n[ipc]\nenabled = false\n\n[web.console]\nenabled = false\nlisten = \"127.0.0.1:1\"\ninclude_config = false\n",
+                root.path()
+                    .join("home")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let store = ConfiguredPluginStore::open(&config_path);
+        store
+            .patch_product_surface(BTreeMap::from([
+                ("profile".into(), serde_json::json!("prod")),
+                ("console_enabled".into(), serde_json::json!(true)),
+                ("console_listen".into(), serde_json::json!("127.0.0.1:8787")),
+                ("include_config".into(), serde_json::json!(true)),
+            ]))
+            .unwrap();
+        let persisted: toml::Value =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(persisted["service"]["profile"].as_str(), Some("prod"));
+        assert_eq!(persisted["service"]["instance_id"].as_str(), Some("demo"));
+        assert_eq!(persisted["web"]["console"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            persisted["web"]["console"]["listen"].as_str(),
+            Some("127.0.0.1:8787")
+        );
+        assert_eq!(
+            persisted["web"]["console"]["include_config"].as_bool(),
+            Some(true)
+        );
+        assert!(matches!(
+            store.patch_product_surface(BTreeMap::from([(
+                "instance_id".into(),
+                serde_json::json!("hijack")
+            )])),
+            Err(ConfigError::ProductSurfaceReadOnly { .. })
+        ));
     }
 
     #[test]
