@@ -48,6 +48,8 @@ pub enum ControlMethod {
     TaskOutcomesBatch = 0x0015,
     TaskWait = 0x0016,
     RuntimeStatistics = 0x0017,
+    /// Host process metrics (pid / RSS / CPU) for the console dashboard.
+    HostMetrics = 0x0018,
 }
 
 impl ControlMethod {
@@ -80,6 +82,7 @@ impl ControlMethod {
             0x0015 => Self::TaskOutcomesBatch,
             0x0016 => Self::TaskWait,
             0x0017 => Self::RuntimeStatistics,
+            0x0018 => Self::HostMetrics,
             _ => return None,
         })
     }
@@ -176,6 +179,19 @@ pub struct ServiceStatus {
     pub core_running: bool,
     pub plugin_count: usize,
     pub runner_count: usize,
+}
+
+/// Host process metrics for the overview dashboard (read-only).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostMetrics {
+    pub pid: u32,
+    pub uptime_ms: u128,
+    /// Resident set size in bytes when the platform can report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    /// Cumulative process CPU time in milliseconds when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_time_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

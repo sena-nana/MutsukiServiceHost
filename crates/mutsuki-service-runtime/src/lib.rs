@@ -35,7 +35,7 @@ use mutsuki_service_config::{
 };
 use mutsuki_service_control::{
     ControlError, ControlFuture, ControlHandler, ControlMethod, ControlRequest, ControlResponse,
-    CoreDrainResponse, CoreStatus, HealthReport, IdParam, LogTailEntry, LogTailParams,
+    CoreDrainResponse, CoreStatus, HealthReport, HostMetrics, IdParam, LogTailEntry, LogTailParams,
     LogTailResponse, PluginCandidateStatus, PluginDeploymentClearParam, PluginDeploymentParam,
     PluginInventoryDiagnostic, PluginListResponse, PluginReloadChange, PluginReloadResponse,
     PluginStatus, RunnerStatus as ControlRunnerStatus, RuntimeStatisticsView, ServiceStatus,
@@ -933,6 +933,7 @@ impl ServiceRuntimeInner {
             ControlMethod::HealthCheck => self.health_check().await,
             ControlMethod::LogTail => self.log_tail(request.params),
             ControlMethod::RuntimeStatistics => self.runtime_statistics(),
+            ControlMethod::HostMetrics => self.host_metrics(),
         }
     }
 
@@ -951,6 +952,15 @@ impl ServiceRuntimeInner {
             core_running,
             plugin_count: self.catalog.lock().expect("catalog mutex").records.len(),
             runner_count: runners.len(),
+        })
+    }
+
+    fn host_metrics(&self) -> ControlResponse {
+        ControlResponse::ok(HostMetrics {
+            pid: std::process::id(),
+            uptime_ms: self.started_at.elapsed().as_millis(),
+            rss_bytes: current_rss_bytes(),
+            cpu_time_ms: current_cpu_time_ms(),
         })
     }
 
@@ -2373,6 +2383,49 @@ fn task_wait_response(states: Vec<HostTaskState>, timed_out: bool) -> ControlRes
     })
 }
 
+fn current_cpu_time_ms() -> Option<u64> {
+    cpu_time::ProcessTime::try_now()
+        .ok()
+        .map(|time| u64::try_from(time.as_duration().as_millis()).unwrap_or(u64::MAX))
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return None;
+        }
+        Some(pages.saturating_mul(page_size as u64))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem::MaybeUninit;
+        let mut info = MaybeUninit::<libc::mach_task_basic_info>::uninit();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        #[allow(deprecated)]
+        let kr = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                libc::MACH_TASK_BASIC_INFO,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(info.resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 fn drain_blocking_stderr(runner_id: String, stderr: std::process::ChildStderr) {
     let reader = BufReader::new(stderr);
     for line in reader.lines().map_while(Result::ok) {
@@ -2392,7 +2445,9 @@ mod tests {
         RunnerPayloadCapability, RunnerPurity, RunnerResourceCapability, Task, WorkBatch,
     };
     use mutsuki_runtime_sdk::map_work_batch_entries;
-    use mutsuki_service_control::{PluginReloadResponse, TaskOutcomeView, TaskSnapshot};
+    use mutsuki_service_control::{
+        HostMetrics, PluginReloadResponse, TaskOutcomeView, TaskSnapshot,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2803,6 +2858,27 @@ mod tests {
         );
         assert!(snapshots[0].lease_id.is_none());
         assert!(snapshots[0].failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn host_metrics_returns_process_snapshot() {
+        let dir = tempdir().expect("temp dir");
+        let inner = test_started_runtime_inner("token", dir.path()).await;
+        let response = inner
+            .handle_request(ControlRequest {
+                token: "token".into(),
+                method: ControlMethod::HostMetrics,
+                params: Value::Null,
+            })
+            .await;
+        assert!(response.ok, "{response:?}");
+        let metrics: HostMetrics =
+            serde_json::from_value(response.result.expect("result")).expect("host metrics");
+        assert_eq!(metrics.pid, std::process::id());
+        assert!(metrics.cpu_time_ms.is_some());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(metrics.rss_bytes.unwrap_or(0) > 0);
+        // uptime_ms may be 0 when the runtime was just started.
     }
 
     #[tokio::test]

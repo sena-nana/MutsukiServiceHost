@@ -72,6 +72,12 @@ fn control_method_opcodes_are_stable() {
         ControlMethod::from_opcode(0x0017),
         Some(ControlMethod::RuntimeStatistics)
     );
+    assert_eq!(ControlMethod::HostMetrics.opcode(), 0x0018);
+    assert_eq!(
+        ControlMethod::from_opcode(0x0018),
+        Some(ControlMethod::HostMetrics)
+    );
+    assert!(!ControlMethod::HostMetrics.is_mutating());
     assert!(ControlMethod::PluginReload.is_mutating());
     assert!(!ControlMethod::HealthCheck.is_mutating());
     assert!(!ControlMethod::RuntimeStatistics.is_mutating());

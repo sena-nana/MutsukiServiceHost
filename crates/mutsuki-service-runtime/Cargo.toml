@@ -20,11 +20,15 @@ mutsuki-service-link.workspace = true
 mutsuki-service-observe.workspace = true
 mutsuki-service-plugin-loader.workspace = true
 mutsuki-service-runner-supervisor.workspace = true
+cpu-time.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 cpu-time.workspace = true
